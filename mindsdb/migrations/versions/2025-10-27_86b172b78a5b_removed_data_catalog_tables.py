@@ -4,6 +4,7 @@ Revision ID: 86b172b78a5b
 Revises: 54ed56beb47a
 Create Date: 2025-10-27 11:14:14.671837
 
+OSCAR Customization: Added explicit VARCHAR lengths for MySQL compatibility in downgrade.
 """
 
 from alembic import op
@@ -28,6 +29,7 @@ def upgrade():
 
 
 def downgrade():
+    # OSCAR: Use String(255) and Text() for MySQL compatibility
     op.create_table(
         "meta_tables",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -37,21 +39,21 @@ def downgrade():
             sa.ForeignKey("integration.id"),
             nullable=False,
         ),
-        sa.Column("name", sa.String(), nullable=False),
-        sa.Column("schema", sa.String(), nullable=True),
-        sa.Column("description", sa.String(), nullable=True),
-        sa.Column("type", sa.String(), nullable=True),
-        sa.Column("row_count", sa.BigInteger(), nullable=True),  # Updated data type
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("schema", sa.String(255), nullable=True),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("type", sa.String(100), nullable=True),
+        sa.Column("row_count", sa.BigInteger(), nullable=True),
     )
 
     op.create_table(
         "meta_columns",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("table_id", sa.Integer(), sa.ForeignKey("meta_tables.id"), nullable=False),
-        sa.Column("name", sa.String(), nullable=False),
-        sa.Column("data_type", sa.String(), nullable=False),
-        sa.Column("default_value", sa.String(), nullable=True),
-        sa.Column("description", sa.String(), nullable=True),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("data_type", sa.String(255), nullable=False),
+        sa.Column("default_value", sa.Text(), nullable=True),
+        sa.Column("description", sa.Text(), nullable=True),
         sa.Column("is_nullable", sa.Boolean(), nullable=True),
     )
 
@@ -66,9 +68,9 @@ def downgrade():
         sa.Column("most_common_values", Array(), nullable=True),
         sa.Column("most_common_frequencies", Array(), nullable=True),
         sa.Column("null_percentage", sa.Numeric(5, 2), nullable=True),
-        sa.Column("distinct_values_count", sa.BigInteger(), nullable=True),  # Updated data type
-        sa.Column("minimum_value", sa.String(), nullable=True),
-        sa.Column("maximum_value", sa.String(), nullable=True),
+        sa.Column("distinct_values_count", sa.BigInteger(), nullable=True),
+        sa.Column("minimum_value", sa.String(255), nullable=True),
+        sa.Column("maximum_value", sa.String(255), nullable=True),
     )
 
     op.create_table(
@@ -81,7 +83,7 @@ def downgrade():
             primary_key=True,
         ),
         sa.Column("ordinal_position", sa.Integer(), nullable=True),
-        sa.Column("constraint_name", sa.String(), nullable=True),
+        sa.Column("constraint_name", sa.String(255), nullable=True),
     )
 
     op.create_table(
@@ -110,5 +112,5 @@ def downgrade():
             sa.ForeignKey("meta_columns.id"),
             primary_key=True,
         ),
-        sa.Column("constraint_name", sa.String(), nullable=True),
+        sa.Column("constraint_name", sa.String(255), nullable=True),
     )

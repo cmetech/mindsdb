@@ -109,9 +109,11 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 class Array(types.TypeDecorator):
-    """Float Type that replaces commas with  dots on input"""
+    """Array type stored as delimited string. Uses Text for MySQL compatibility."""
 
-    impl = types.String
+    # OSCAR: Changed from types.String to types.Text for MySQL compatibility
+    # types.String requires a length on MySQL, types.Text does not
+    impl = types.Text
 
     def process_bind_param(self, value, dialect):  # insert
         if isinstance(value, str):
@@ -126,9 +128,11 @@ class Array(types.TypeDecorator):
 
 
 class Json(types.TypeDecorator):
-    """Float Type that replaces commas with  dots on input"""
+    """JSON type stored as text. Uses Text for MySQL compatibility."""
 
-    impl = types.String
+    # OSCAR: Changed from types.String to types.Text for MySQL compatibility
+    # types.String requires a length on MySQL, types.Text does not
+    impl = types.Text
 
     def process_bind_param(self, value, dialect):  # insert
         return json.dumps(value, cls=NumpyEncoder) if value is not None else None

@@ -19,7 +19,13 @@ db.init()
 
 target_metadata = db.Base.metadata
 
-config.set_main_option("sqlalchemy.url", app_config["storage_db"])
+# OSCAR: Escape % as %% for configparser (% is interpolation marker)
+# This is needed when the database password contains special characters
+# that get URL-encoded (e.g., $ -> %24, & -> %26, % -> %25)
+storage_url = app_config["storage_db"]
+if storage_url:
+    storage_url = storage_url.replace("%", "%%")
+config.set_main_option("sqlalchemy.url", storage_url)
 
 
 # other values from the config, defined by the needs of env.py,

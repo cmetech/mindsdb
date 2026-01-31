@@ -28,6 +28,7 @@ docker/dist/*
 .directory
 MindsDB.egg-info/*
 /build
+/dist
 train_finetune.lock
 parser_tests
 
