@@ -64,6 +64,11 @@ class Scheduler:
                 raise
             except Exception:
                 logger.exception("Error in 'scheduler_monitor'")
+                # Rollback any failed transaction to prevent PendingRollbackError
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass  # Best effort rollback
 
             # different instances should start in not the same time
 
@@ -74,11 +79,13 @@ class Scheduler:
 
         exec_method = self.config.get("jobs", {}).get("executor", "local")
 
-        for record in executor.get_next_tasks():
-            logger.info(f"Job execute: {record.name}({record.id})")
-            self.execute_task(record.id, exec_method)
-
-        db.session.remove()
+        try:
+            for record in executor.get_next_tasks():
+                logger.info(f"Job execute: {record.name}({record.id})")
+                self.execute_task(record.id, exec_method)
+        finally:
+            # Always clean up session, even on error
+            db.session.remove()
 
     def execute_task(self, record_id, exec_method):
         executor = JobsExecutor()
