@@ -8,6 +8,33 @@ from mindsdb.api.http.utils import http_error
 from mindsdb.metrics.metrics import api_endpoint_metrics
 
 from mindsdb.interfaces.jobs.jobs_controller import parse_job_date
+from mindsdb.utilities.exception import EntityNotExistsError, JobLockedException
+
+
+# Allowed internal services for job endpoints (OSCAR-Kore Integration)
+# NOTE: Middleware is included because it overwrites X-Internal-Service to 'middleware' in
+# PROXY_HEADERS when proxying requests. So even though scheduler sets the header, by the
+# time requests reach Kore, the header value is 'middleware'. This is belt-and-suspenders
+# validation; middleware already blocked unauthorized callers via require_internal_service.
+ALLOWED_INTERNAL_SERVICES = {"scheduler", "middleware"}
+
+
+def _validate_internal_service():
+    """Validate caller is an allowed internal service.
+
+    Returns:
+        Error response tuple or None if valid
+    """
+    internal_service = request.headers.get("X-Internal-Service")
+    if not internal_service:
+        return http_error(HTTPStatus.FORBIDDEN, "Internal only", "This endpoint requires X-Internal-Service header")
+    if internal_service not in ALLOWED_INTERNAL_SERVICES:
+        return http_error(
+            HTTPStatus.FORBIDDEN,
+            "Unauthorized service",
+            f"Service '{internal_service}' is not authorized for this endpoint",
+        )
+    return None
 
 
 @ns_conf.route("/<project_name>/jobs")
@@ -75,3 +102,89 @@ class JobsHistory(Resource):
             return http_error(HTTPStatus.NOT_FOUND, "Job not found", f"Job with name {job_name} does not exist")
 
         return ca.jobs_controller.get_history(job_name, project_name)
+
+
+# ============================================================================
+# Job Management Endpoints (OSCAR-Kore Integration)
+# ALL INTERNAL-ONLY - require X-Internal-Service header with allowed value
+# ============================================================================
+
+
+@ns_conf.route("/jobs/pending")
+class JobsPending(Resource):
+    @ns_conf.doc("list_pending_jobs")
+    @api_endpoint_metrics("GET", "/jobs/pending")
+    def get(self):
+        """List jobs ready for execution (INTERNAL-ONLY for scheduler)"""
+        error = _validate_internal_service()
+        if error:
+            return error
+
+        limit = request.args.get("limit", 100, type=int)
+        return ca.jobs_controller.get_pending_jobs(limit=limit)
+
+
+@ns_conf.route("/jobs/<int:job_id>")
+class JobById(Resource):
+    @ns_conf.doc("get_job_by_id")
+    @api_endpoint_metrics("GET", "/jobs/by_id")
+    def get(self, job_id):
+        """Get job details by numeric ID (INTERNAL-ONLY)"""
+        error = _validate_internal_service()
+        if error:
+            return error
+
+        try:
+            return ca.jobs_controller.get_by_id(job_id)
+        except EntityNotExistsError:
+            return http_error(HTTPStatus.NOT_FOUND, "Job not found", f"Job {job_id} does not exist")
+
+
+@ns_conf.route("/jobs/<int:job_id>/execute")
+class JobExecute(Resource):
+    @ns_conf.doc("execute_job")
+    @api_endpoint_metrics("POST", "/jobs/execute")
+    def post(self, job_id):
+        """Execute a job by ID (INTERNAL-ONLY for scheduler)"""
+        error = _validate_internal_service()
+        if error:
+            return error
+
+        try:
+            return ca.jobs_controller.execute_by_id(job_id)
+        except EntityNotExistsError:
+            return http_error(HTTPStatus.NOT_FOUND, "Job not found", f"Job {job_id} does not exist")
+        except JobLockedException as e:
+            return http_error(HTTPStatus.LOCKED, "Job locked", str(e))
+
+
+@ns_conf.route("/jobs/<int:job_id>/pause")
+class JobPause(Resource):
+    @ns_conf.doc("pause_job")
+    @api_endpoint_metrics("POST", "/jobs/pause")
+    def post(self, job_id):
+        """Pause a job (INTERNAL-ONLY)"""
+        error = _validate_internal_service()
+        if error:
+            return error
+
+        try:
+            return ca.jobs_controller.pause(job_id)
+        except EntityNotExistsError:
+            return http_error(HTTPStatus.NOT_FOUND, "Job not found", f"Job {job_id} does not exist")
+
+
+@ns_conf.route("/jobs/<int:job_id>/resume")
+class JobResume(Resource):
+    @ns_conf.doc("resume_job")
+    @api_endpoint_metrics("POST", "/jobs/resume")
+    def post(self, job_id):
+        """Resume a paused job (INTERNAL-ONLY, schedules from NOW)"""
+        error = _validate_internal_service()
+        if error:
+            return error
+
+        try:
+            return ca.jobs_controller.resume(job_id)
+        except EntityNotExistsError:
+            return http_error(HTTPStatus.NOT_FOUND, "Job not found", f"Job {job_id} does not exist")

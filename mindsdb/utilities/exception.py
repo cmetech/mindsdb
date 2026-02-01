@@ -42,6 +42,22 @@ class EntityNotExistsError(BaseEntityException):
         super().__init__(message, entity_name)
 
 
+class JobLockedException(MindsDBError):
+    """Raised when attempting to execute a job that is already locked/running.
+
+    Used by the OSCAR-Kore scheduler integration to prevent duplicate execution.
+    The lock is acquired via unique constraint on (job_id, start_at) in jobs_history table.
+    """
+
+    http_status = 423  # HTTP 423 Locked
+
+    def __init__(self, message: str = None, job_id: int = None) -> None:
+        if message is None:
+            message = f"Job {job_id} is already being executed"
+        super().__init__(message)
+        self.job_id = job_id
+
+
 class ParsingError(MindsDBError):
     pass
 

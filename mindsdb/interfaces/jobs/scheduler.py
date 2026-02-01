@@ -1,4 +1,5 @@
 import datetime as dt
+import os
 import queue
 import random
 import threading
@@ -7,7 +8,7 @@ import time
 from mindsdb.interfaces.jobs.jobs_controller import JobsExecutor
 from mindsdb.interfaces.storage import db
 from mindsdb.utilities import log
-from mindsdb.utilities.config import Config
+from mindsdb.utilities.config import config, Config
 from mindsdb.utilities.sentry import sentry_sdk  # noqa: F401
 
 logger = log.getLogger(__name__)
@@ -135,6 +136,30 @@ class Scheduler:
 
 
 def start(verbose=False):
+    """Start the job scheduler.
+
+    If KORE_EXTERNAL_SCHEDULER=true, exits immediately without starting
+    the internal scheduler. This allows external schedulers (e.g., OSCAR)
+    to manage job execution instead.
+    """
+    # Check if external scheduler is managing jobs - MUST be first
+    external_scheduler = config.get("jobs", {}).get("external_scheduler", False)
+    if not external_scheduler:
+        # Fallback to env var if not in config
+        external_scheduler = os.environ.get("KORE_EXTERNAL_SCHEDULER", "false").lower() == "true"
+
+    if external_scheduler:
+        logger.info("=" * 60)
+        logger.info("EXTERNAL SCHEDULER MODE ENABLED")
+        logger.info("Built-in scheduler will NOT start")
+        logger.info("Jobs will be triggered by external scheduler (e.g., OSCAR)")
+        logger.info("=" * 60)
+
+        # Keep process alive but don't start scheduler
+        while True:
+            time.sleep(3600)  # Sleep 1 hour, repeat
+
+    # Original scheduler startup code
     scheduler = Scheduler()
 
     scheduler.start()

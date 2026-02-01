@@ -122,6 +122,22 @@ Document Upload
 if_query_str = "SELECT COUNT(*) FROM table WHERE condition"
 ```
 
+### External Scheduler Support (OSCAR-Kore Integration)
+
+When `KORE_EXTERNAL_SCHEDULER=true`, the built-in scheduler is disabled and external schedulers can manage job execution via internal-only API methods:
+
+| Method | Purpose |
+|--------|---------|
+| `get_pending_jobs(limit)` | Returns jobs where `next_run_at < now` and `active=true` |
+| `execute_by_id(job_id)` | Executes job with locking via `jobs_history` unique constraint |
+| `pause(job_id)` | Sets `active=false` to exclude from pending queries |
+| `resume(job_id)` | Sets `active=true` and calculates `next_run_at` from NOW |
+| `get_by_id(job_id)` | Retrieves job by numeric ID (internal use) |
+
+**Locking**: The `execute_by_id()` method uses `JobsExecutor.lock_record()` which creates a `jobs_history` entry. The unique constraint on `(job_id, start_at)` prevents duplicate concurrent execution. Returns `JobLockedException` (HTTP 423) if already locked.
+
+**Resume Semantics**: When resuming a paused job, `next_run_at` is calculated from the current time using `calc_next_date(schedule_str, base_date=datetime.now())`. This prevents burst execution of missed runs.
+
 ## Key Files by Complexity
 
 | File | Size | Purpose |

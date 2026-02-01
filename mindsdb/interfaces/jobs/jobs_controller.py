@@ -11,7 +11,7 @@ from mindsdb_sql_parser.ast import Select, Star, Identifier, BinaryOperation, Co
 
 from mindsdb.utilities.config import config
 from mindsdb.utilities.context import context as ctx
-from mindsdb.utilities.exception import EntityNotExistsError, EntityExistsError
+from mindsdb.utilities.exception import EntityNotExistsError, EntityExistsError, JobLockedException
 from mindsdb.interfaces.storage import db
 from mindsdb.interfaces.database.projects import ProjectController
 from mindsdb.interfaces.query_context.context_controller import query_context_controller
@@ -252,6 +252,189 @@ class JobsController:
     def _delete_record(self, record):
         record.deleted_at = dt.datetime.now()
 
+    def _get_record_by_id(self, job_id: int):
+        """Get job record by numeric ID.
+
+        Used by OSCAR-Kore integration for scheduler operations.
+        Does NOT filter by company_id - caller must ensure proper authorization
+        (internal-only endpoints) or let execute_task_local set the context.
+
+        Args:
+            job_id: Numeric job ID
+
+        Returns:
+            db.Jobs record
+
+        Raises:
+            EntityNotExistsError: If job not found or deleted
+        """
+        record = db.session.query(db.Jobs).filter_by(id=job_id).filter(db.Jobs.deleted_at == sa.null()).first()
+        if record is None:
+            raise EntityNotExistsError("Job does not exist", str(job_id))
+        return record
+
+    def get_pending_jobs(self, limit: int = 100) -> List[dict]:
+        """Get jobs ready for execution (INTERNAL-ONLY).
+
+        Used by external scheduler (OSCAR) to poll for work.
+
+        Args:
+            limit: Maximum number of jobs to return (default 100, max 500)
+
+        Returns:
+            Dict with:
+                - total_pending: Total count of jobs ready to run
+                - returned: Number of jobs returned (limited by batch size)
+                - jobs: List of job dicts with id, name, project, next_run_at, schedule_str
+
+        Note:
+            Returns ALL pending jobs regardless of company_id.
+            This is safe because this endpoint is internal-only.
+            Each job execution sets its own company context.
+        """
+        limit = min(limit, 500)  # Cap at 500
+
+        # Query for pending jobs (next_run_at in past, active, not deleted)
+        query = (
+            db.session.query(db.Jobs)
+            .filter(
+                db.Jobs.next_run_at < dt.datetime.now(),
+                db.Jobs.deleted_at == sa.null(),
+                db.Jobs.active.is_(True),
+            )
+            .order_by(db.Jobs.next_run_at)
+            .limit(limit)
+        )
+
+        # Get total count for logging (scheduler needs to know if more exist)
+        total_count = (
+            db.session.query(db.Jobs)
+            .filter(
+                db.Jobs.next_run_at < dt.datetime.now(),
+                db.Jobs.deleted_at == sa.null(),
+                db.Jobs.active.is_(True),
+            )
+            .count()
+        )
+
+        # Build project name lookup
+        project_controller = ProjectController()
+        project_names = {p.id: p.name for p in project_controller.get_list()}
+
+        return {
+            "total_pending": total_count,
+            "returned": min(limit, total_count),
+            "jobs": [
+                {
+                    "id": record.id,
+                    "name": record.name,
+                    "project": project_names.get(record.project_id),
+                    "next_run_at": record.next_run_at.isoformat() if record.next_run_at else None,
+                    "schedule_str": record.schedule_str,
+                }
+                for record in query.all()
+            ],
+        }
+
+    def execute_by_id(self, job_id: int) -> dict:
+        """Execute a job by ID with locking to prevent duplicate execution.
+
+        This is used by external schedulers (OSCAR) to trigger job execution.
+
+        Args:
+            job_id: Numeric job ID
+
+        Returns:
+            Updated job info after execution
+
+        Raises:
+            EntityNotExistsError: If job not found
+            JobLockedException: If job is already being executed (HTTP 423)
+        """
+        # Verify job exists first
+        record = self._get_record_by_id(job_id)
+
+        # Create executor and acquire lock
+        executor = JobsExecutor()
+        history_id = executor.lock_record(job_id)
+
+        if history_id is None:
+            raise JobLockedException(f"Job '{record.name}' (id={job_id}) is already being executed", job_id=job_id)
+
+        try:
+            # Execute with the acquired lock
+            executor.execute_task_local(job_id, history_id=history_id)
+        except Exception as e:
+            # Log but don't re-raise - job history will capture error
+            logger.error(f"Job {job_id} execution error: {e}")
+
+        # Return updated job info
+        project_controller = ProjectController()
+        project = project_controller.get(record.project_id)
+        return self.get(record.name, project.name)
+
+    def pause(self, job_id: int) -> dict:
+        """Pause a job - prevents future executions until resumed.
+
+        Used by OSCAR-Kore integration (internal-only endpoint).
+
+        Args:
+            job_id: Numeric job ID
+
+        Returns:
+            Updated job info with active=false
+        """
+        record = self._get_record_by_id(job_id)
+        record.active = False
+        db.session.commit()
+
+        project_controller = ProjectController()
+        project = project_controller.get(record.project_id)
+        return self.get(record.name, project.name)
+
+    def resume(self, job_id: int) -> dict:
+        """Resume a paused job.
+
+        Calculates next_run_at from NOW (not catch-up) to prevent
+        burst execution of missed runs.
+
+        Used by OSCAR-Kore integration (internal-only endpoint).
+
+        Args:
+            job_id: Numeric job ID
+
+        Returns:
+            Updated job info with active=true and new next_run_at
+        """
+        record = self._get_record_by_id(job_id)
+        record.active = True
+
+        # Calculate next run from NOW (not catch-up)
+        if record.schedule_str:
+            record.next_run_at = calc_next_date(record.schedule_str, base_date=dt.datetime.now())
+
+        db.session.commit()
+
+        project_controller = ProjectController()
+        project = project_controller.get(record.project_id)
+        return self.get(record.name, project.name)
+
+    def get_by_id(self, job_id: int) -> dict:
+        """Get job details by numeric ID.
+
+        Used by OSCAR-Kore integration (internal-only endpoint).
+
+        Args:
+            job_id: Numeric job ID
+
+        Returns:
+            Job details dict (same format as get())
+        """
+        record = self._get_record_by_id(job_id)
+        project_controller = ProjectController()
+        project = project_controller.get(record.project_id)
+        return self.get(record.name, project.name)
+
     def get_list(self, project_name=None):
         query = db.session.query(db.Jobs).filter_by(company_id=ctx.company_id, deleted_at=sa.null())
 
@@ -268,6 +451,7 @@ class JobsController:
                     "id": record.id,
                     "name": record.name,
                     "project": project_names[record.project_id],
+                    "active": record.active,
                     "start_at": record.start_at,
                     "end_at": record.end_at,
                     "next_run_at": record.next_run_at,
@@ -301,6 +485,7 @@ class JobsController:
                 "id": record.id,
                 "name": record.name,
                 "project": project_name,
+                "active": record.active,
                 "start_at": record.start_at,
                 "end_at": record.end_at,
                 "next_run_at": record.next_run_at,
