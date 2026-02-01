@@ -58,24 +58,55 @@ make run_docker                         # Build and run (port 47334)
 
 ## Architecture
 
+### Three-Layer Design
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Response Layer (api/)                                      │
+│  HTTP REST, MySQL Protocol, MCP, A2A, Query Executor        │
+├─────────────────────────────────────────────────────────────┤
+│  Unification Layer (interfaces/)                            │
+│  Agents, Skills, Knowledge Bases, Models, Jobs, Storage     │
+├─────────────────────────────────────────────────────────────┤
+│  Connection Layer (integrations/)                           │
+│  100+ Data Source Handlers (databases, APIs, ML, vectors)   │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### Directory Structure
 ```
 mindsdb/
-├── api/                    # Response Layer - HTTP, MySQL protocol, MCP, executor
-│   ├── http/              # REST API endpoints
+├── api/                    # Response Layer - see api/CLAUDE.md
+│   ├── http/              # REST API (Flask-RESTX)
 │   ├── mysql/             # MySQL wire protocol server
 │   ├── executor/          # Query execution engine
-│   └── mcp/               # Model Context Protocol support
-├── interfaces/            # Unification Layer - core business logic
-│   ├── agents/            # AI agent implementations
-│   ├── knowledge_base/    # Unstructured data indexing
-│   ├── model/             # ML model interface
-│   ├── jobs/              # Task scheduling
-│   └── database/          # Database abstraction
-├── integrations/          # Connection Layer - 100+ data source handlers
-│   └── handlers/          # Each handler is a self-contained integration
-└── utilities/             # Shared utilities (config, logging, auth, cache)
+│   ├── mcp/               # Model Context Protocol (Claude)
+│   └── a2a/               # Agent-to-Agent protocol
+├── interfaces/            # Unification Layer - see interfaces/CLAUDE.md
+│   ├── agents/            # AI agent framework (LangChain)
+│   ├── knowledge_base/    # RAG vector storage
+│   ├── skills/            # Agent capabilities
+│   ├── model/             # ML model registry
+│   ├── jobs/              # Scheduled queries
+│   ├── chatbot/           # Conversational interfaces
+│   ├── database/          # Projects, integrations, views
+│   └── storage/           # ORM models, file storage
+├── integrations/          # Connection Layer - see integrations/CLAUDE.md
+│   ├── handlers/          # 219 self-contained integrations
+│   ├── libs/              # Base classes, response types
+│   └── utilities/         # Handler utilities, RAG pipeline
+├── utilities/             # Shared infrastructure - see utilities/CLAUDE.md
+│   ├── ml_task_queue/     # Redis-backed distributed tasks
+│   ├── otel/              # OpenTelemetry observability
+│   └── hooks/             # Plugin system
+└── migrations/            # Alembic database migrations
 ```
+
+### Subdirectory Context Files
+Each major directory has its own CLAUDE.md with detailed architecture:
+- `mindsdb/api/CLAUDE.md` - Protocol layer, executor, query flow
+- `mindsdb/interfaces/CLAUDE.md` - Business logic, controllers, ORM models
+- `mindsdb/integrations/CLAUDE.md` - Handler framework, adding handlers
+- `mindsdb/utilities/CLAUDE.md` - Config, logging, caching, task queue
 
 ### Handler Structure
 Each integration handler (e.g., `postgres_handler/`) contains:
@@ -84,6 +115,25 @@ Each integration handler (e.g., `postgres_handler/`) contains:
 - `connection_args.py` - Connection parameter definitions
 - `requirements.txt` - Handler-specific dependencies (optional)
 - `README.md` - User documentation
+
+## Database Migrations
+
+Alembic migrations in `mindsdb/migrations/`. Auto-applied on startup.
+
+```bash
+cd mindsdb/migrations
+
+# Create new migration after model changes
+env PYTHONPATH=../../ alembic revision --autogenerate -m "description"
+
+# Apply migrations manually
+env PYTHONPATH=../../ alembic upgrade head
+
+# Rollback
+env PYTHONPATH=../../ alembic downgrade -1
+```
+
+**Note**: OSCAR fork escapes `%` as `%%` in `env.py` for passwords with special characters.
 
 ## Code Standards
 
