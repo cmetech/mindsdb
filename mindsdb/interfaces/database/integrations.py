@@ -183,24 +183,10 @@ class IntegrationController:
             return None
         data = deepcopy(integration_record.data)
 
-        bundle_path = data.get("secure_connect_bundle")
-        mysql_ssl_ca = data.get("ssl_ca")
-        mysql_ssl_cert = data.get("ssl_cert")
-        mysql_ssl_key = data.get("ssl_key")
-        if (
-            data.get("type") in ("mysql", "mariadb")
-            and (
-                self._is_not_empty_str(mysql_ssl_ca)
-                or self._is_not_empty_str(mysql_ssl_cert)
-                or self._is_not_empty_str(mysql_ssl_key)
-            )
-            or data.get("type") in ("cassandra", "scylla")
-            and bundle_path is not None
-        ):
-            fs_store = FsStore()
-            integrations_dir = Config()["paths"]["integrations"]
-            folder_name = f"integration_files_{integration_record.company_id}_{integration_record.id}"
-            fs_store.get(folder_name, base_dir=integrations_dir)
+        # Check for external connection (OSCAR Vault)
+        # External connections only store {"connection_id": "...", "external": true}
+        # No actual credentials to mask or process
+        is_external = data.get("external") and data.get("connection_id")
 
         handler_meta = self.get_handler_metadata(integration_record.engine)
         integration_type = None
@@ -208,6 +194,30 @@ class IntegrationController:
             # in other cases, the handler directory is likely not exist.
             integration_type = handler_meta.get("type")
 
+        # For external connections, skip file processing - they only store connection_id references
+        # But still apply masking below as defense-in-depth
+        if not is_external:
+            bundle_path = data.get("secure_connect_bundle")
+            mysql_ssl_ca = data.get("ssl_ca")
+            mysql_ssl_cert = data.get("ssl_cert")
+            mysql_ssl_key = data.get("ssl_key")
+            if (
+                data.get("type") in ("mysql", "mariadb")
+                and (
+                    self._is_not_empty_str(mysql_ssl_ca)
+                    or self._is_not_empty_str(mysql_ssl_cert)
+                    or self._is_not_empty_str(mysql_ssl_key)
+                )
+                or data.get("type") in ("cassandra", "scylla")
+                and bundle_path is not None
+            ):
+                fs_store = FsStore()
+                integrations_dir = Config()["paths"]["integrations"]
+                folder_name = f"integration_files_{integration_record.company_id}_{integration_record.id}"
+                fs_store.get(folder_name, base_dir=integrations_dir)
+
+        # Apply masking for all connections (including external) as defense-in-depth
+        # External connections shouldn't contain secrets, but mask anyway as a safety net
         if show_secrets is False and handler_meta is not None:
             connection_args = handler_meta.get("connection_args", None)
             if isinstance(connection_args, dict):
@@ -422,11 +432,7 @@ class IntegrationController:
         Returns:
             BaseHandler: data handler
         """
-        handler = self.handlers_cache.get(name)
-        if handler is not None:
-            ctx.used_handlers.add(getattr(handler.__class__, "name", handler.__class__.__name__))
-            return handler
-
+        # 1. Get integration record first (MUST happen before cache check for external connections)
         integration_record = self._get_integration_record(name, case_sensitive)
         integration_engine = integration_record.engine
 
@@ -442,12 +448,47 @@ class IntegrationController:
         if integration_data is None:
             raise Exception(f"Can't find integration_record for handler '{name}'")
         connection_data = integration_data.get("connection_data", {})
-        logger.debug(
-            "%s.get_handler: connection_data=%s, engine=%s",
-            self.__class__.__name__,
-            connection_data,
-            integration_engine,
-        )
+
+        # 2. Check if this is an external connection (OSCAR Vault)
+        is_external = connection_data.get("external") and connection_data.get("connection_id")
+
+        # 3. Handle cache based on connection type
+        if is_external:
+            # CRITICAL: Evict any pre-existing cached handler to prevent stale credentials
+            self.handlers_cache.delete(name)
+            logger.debug(f"External connection detected for '{name}', evicting cache")
+        else:
+            # Only use cache for NON-external connections
+            handler = self.handlers_cache.get(name)
+            if handler is not None:
+                ctx.used_handlers.add(getattr(handler.__class__, "name", handler.__class__.__name__))
+                return handler
+
+        # 4. For external connections: resolve fresh credentials from OSCAR Vault
+        if is_external:
+            # Import here to avoid circular dependencies
+            from mindsdb.utilities.oscar_vault import (
+                resolve_connection,
+                ConnectionNotFoundError,
+                VaultConnectionError,
+                OscarVaultError,
+            )
+
+            connection_id = connection_data["connection_id"]
+            try:
+                connection_data = resolve_connection(connection_id, integration_engine)
+                # Log only connection_id and engine, NEVER log resolved credentials
+                logger.info(
+                    f"Resolved external connection '{connection_id}' for handler '{name}' (engine={integration_engine})"
+                )
+            except (ConnectionNotFoundError, VaultConnectionError, OscarVaultError) as e:
+                raise Exception(f"Failed to resolve external connection '{connection_id}': {e}")
+        else:
+            logger.debug(
+                "%s.get_handler: engine=%s",
+                self.__class__.__name__,
+                integration_engine,
+            )
 
         if integration_meta["import"]["success"] is False:
             msg = dedent(f"""\
@@ -495,7 +536,9 @@ class IntegrationController:
 
         HandlerClass = self.handler_modules[integration_engine].Handler
         handler = HandlerClass(**handler_ars)
-        if connect:
+
+        # 5. Only cache NON-external handlers
+        if connect and not is_external:
             self.handlers_cache.set(handler)
 
         ctx.used_handlers.add(getattr(handler.__class__, "name", handler.__class__.__name__))

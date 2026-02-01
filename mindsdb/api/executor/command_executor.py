@@ -117,6 +117,13 @@ from mindsdb.utilities.context import context as ctx
 from mindsdb.utilities.functions import mark_process, resolve_model_identifier, get_handler_install_message
 from mindsdb.utilities.exception import EntityExistsError, EntityNotExistsError
 from mindsdb.utilities import log
+from mindsdb.utilities.oscar_vault import (
+    resolve_connection,
+    validate_external_storage_data,
+    ConnectionNotFoundError,
+    VaultConnectionError,
+    OscarVaultError,
+)
 
 logger = log.getLogger(__name__)
 
@@ -1107,6 +1114,10 @@ class ExecuteCommands:
             connection_args = {}
         status = HandlerStatusResponse(success=False)
 
+        # Check for external connection via OSCAR Vault
+        connection_id = connection_args.get("connection_id")
+        is_external = connection_id is not None
+
         storage = None
         try:
             handler_meta = self.session.integration_controller.get_handler_meta(engine)
@@ -1118,37 +1129,64 @@ class ExecuteCommands:
                     f"The '{engine}' handler isn't installed.\n" + get_handler_install_message(engine)
                 )
 
-            accept_connection_args = handler_meta.get("connection_args")
-            if accept_connection_args is not None and connection_args is not None:
-                for arg_name, arg_value in connection_args.items():
-                    if arg_name not in accept_connection_args:
-                        continue
-                    arg_meta = accept_connection_args[arg_name]
-                    arg_type = arg_meta.get("type")
-                    if arg_type == HANDLER_CONNECTION_ARG_TYPE.PATH:
-                        # arg may be one of:
-                        # str: '/home/file.pem'
-                        # dict: {'path': '/home/file.pem'}
-                        # dict: {'url': 'https://host.com/file'}
-                        arg_value = connection_args[arg_name]
-                        if isinstance(arg_value, (str, dict)) is False:
-                            raise ExecutorException(f"Unknown type of arg: '{arg_value}'")
-                        if isinstance(arg_value, str) or "path" in arg_value:
-                            path = arg_value if isinstance(arg_value, str) else arg_value["path"]
-                            if Path(path).is_file() is False:
-                                raise ExecutorException(f"File not found at: '{path}'")
-                        elif "url" in arg_value:
-                            path = download_file(arg_value["url"])
-                        else:
-                            raise ExecutorException(f"Argument '{arg_name}' must be path or url to the file")
-                        connection_args[arg_name] = path
+            # Handle external connections (OSCAR Vault)
+            if is_external:
+                try:
+                    # Resolve credentials from OSCAR Vault for testing
+                    # CRITICAL: Use separate variable for testing - DO NOT pass to add()
+                    test_credentials = resolve_connection(connection_id, engine)
+                    logger.info(
+                        f"Resolved external connection '{connection_id}' for database '{name}' (engine={engine})"
+                    )
 
-            handler = self.session.integration_controller.create_tmp_handler(
-                name=name, engine=engine, connection_args=connection_args
-            )
-            status = handler.check_connection()
-            if status.copy_storage:
-                storage = handler.handler_storage.export_files()
+                    # Test connection with resolved credentials
+                    handler = self.session.integration_controller.create_tmp_handler(
+                        name=name, engine=engine, connection_args=test_credentials
+                    )
+                    status = handler.check_connection()
+                    if status.copy_storage:
+                        storage = handler.handler_storage.export_files()
+
+                except ConnectionNotFoundError as e:
+                    raise ExecutorException(f"External connection failed: {e}")
+                except VaultConnectionError as e:
+                    raise ExecutorException(f"Cannot reach OSCAR Vault: {e}")
+                except OscarVaultError as e:
+                    raise ExecutorException(f"OSCAR Vault error: {e}")
+
+            else:
+                # Traditional inline credentials mode
+                accept_connection_args = handler_meta.get("connection_args")
+                if accept_connection_args is not None and connection_args is not None:
+                    for arg_name, arg_value in connection_args.items():
+                        if arg_name not in accept_connection_args:
+                            continue
+                        arg_meta = accept_connection_args[arg_name]
+                        arg_type = arg_meta.get("type")
+                        if arg_type == HANDLER_CONNECTION_ARG_TYPE.PATH:
+                            # arg may be one of:
+                            # str: '/home/file.pem'
+                            # dict: {'path': '/home/file.pem'}
+                            # dict: {'url': 'https://host.com/file'}
+                            arg_value = connection_args[arg_name]
+                            if isinstance(arg_value, (str, dict)) is False:
+                                raise ExecutorException(f"Unknown type of arg: '{arg_value}'")
+                            if isinstance(arg_value, str) or "path" in arg_value:
+                                path = arg_value if isinstance(arg_value, str) else arg_value["path"]
+                                if Path(path).is_file() is False:
+                                    raise ExecutorException(f"File not found at: '{path}'")
+                            elif "url" in arg_value:
+                                path = download_file(arg_value["url"])
+                            else:
+                                raise ExecutorException(f"Argument '{arg_name}' must be path or url to the file")
+                            connection_args[arg_name] = path
+
+                handler = self.session.integration_controller.create_tmp_handler(
+                    name=name, engine=engine, connection_args=connection_args
+                )
+                status = handler.check_connection()
+                if status.copy_storage:
+                    storage = handler.handler_storage.export_files()
         except Exception as e:
             status.error_message = str(e)
 
@@ -1165,7 +1203,15 @@ class ExecuteCommands:
         if integration is not None:
             raise EntityExistsError("Project exists with this name", name)
 
-        self.session.integration_controller.add(name, engine, connection_args)
+        # CRITICAL: For external connections, store ONLY the reference, NOT credentials
+        if is_external:
+            storage_data = {"connection_id": connection_id, "external": True}
+            # Validate storage_data contains only allowed keys (defense-in-depth)
+            validate_external_storage_data(storage_data)
+            self.session.integration_controller.add(name, engine, storage_data)
+        else:
+            self.session.integration_controller.add(name, engine, connection_args)
+
         if storage:
             handler = self.session.integration_controller.get_data_handler(name, connect=False)
             handler.handler_storage.import_files(storage)

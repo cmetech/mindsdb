@@ -153,3 +153,82 @@ env PYTHONPATH=../../ alembic downgrade -1
 |---------|------|---------|
 | mindsdb | 47334 (HTTP), 47335 (MySQL) | Main server |
 | postgres | 5432 | Test database |
+
+## OSCAR Vault Integration
+
+When running as Kore within the OSCAR platform, MindsDB supports fetching database credentials from OSCAR's HashiCorp Vault instead of storing them directly in the Integration table.
+
+### Enabling Vault Integration
+
+Configuration is read from `Config()` which is populated by `config_validator.py` from environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KORE_OSCAR_VAULT_ENABLED` | `false` | Enable Vault credential resolution |
+| `KORE_OSCAR_VAULT_MIDDLEWARE_URL` | `https://middleware:5200` | OSCAR middleware URL |
+| `KORE_OSCAR_VAULT_CACHE_TTL` | `60` | Cache TTL in seconds (0 for strict freshness) |
+| `KORE_OSCAR_VAULT_SSL_VERIFY` | `false` | SSL certificate verification |
+
+### Usage
+
+```sql
+-- Create a database using external credentials from OSCAR Vault
+CREATE DATABASE vault_db
+WITH ENGINE = 'mysql',
+PARAMETERS = {"connection_id": "prod_mysql"};
+
+-- Query works transparently - credentials fetched from Vault
+SELECT * FROM vault_db.some_table LIMIT 10;
+```
+
+### Vault Credential Storage
+
+Credentials must be stored in OSCAR Vault at: `airflow/connections/{connection_id}`
+with a key named `credentials`.
+
+**Two credential shapes are supported (auto-detected):**
+
+#### 1. OSCAR Registry Shape (recommended for OSCAR ecosystem)
+```json
+{
+  "conn_type": "mysql",
+  "host": "db.example.com",
+  "port": 3306,
+  "login": "admin",
+  "password": "secure-password",
+  "schema": "production",
+  "extra": "{\"ssl_ca\": \"/path/to/ca.pem\"}",
+  "description": "Production MySQL database"
+}
+```
+
+#### 2. Handler Shape (MindsDB native)
+```json
+{
+  "host": "db.example.com",
+  "port": 3306,
+  "user": "admin",
+  "password": "secure-password",
+  "database": "production"
+}
+```
+
+### Credential Shape Conversion
+
+When registry shape is detected (`conn_type`, `login`, or `schema` keys present), fields are automatically mapped:
+
+| Engine | `login` → | `schema` → |
+|--------|-----------|------------|
+| mysql/mariadb | `user` | `database` |
+| postgres | `user` | `database` |
+| mongodb | `username` | `database` |
+| oracle | `user` | `service_name` |
+| mssql | `user` | `database` |
+
+The `extra` field is parsed as JSON and whitelisted keys (`ssl_ca`, `ssl_cert`, `ssl_key`, `charset`, `sslmode`) are merged into credentials.
+
+### Key Files
+
+- `mindsdb/utilities/oscar_vault.py` - Vault client with caching and field mapping
+- `mindsdb/api/executor/command_executor.py` - External connection detection in `_create_integration()`
+- `mindsdb/interfaces/database/integrations.py` - Cache bypass in `get_data_handler()`
