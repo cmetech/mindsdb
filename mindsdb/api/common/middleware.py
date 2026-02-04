@@ -76,7 +76,72 @@ class PATAuthMiddleware(BaseHTTPMiddleware):
 
 
 # Used by mysql protocol
-def check_auth(username, password, scramble_func, salt, company_id, config):
+def check_auth(username, password, scramble_func, salt, company_id, config, client_address=None):
+    """
+    Authenticate MySQL protocol connections.
+
+    PRD-MySQL-Auth: Routes to OSCAR auth when config["oscar_mysql_auth"]["enabled"] is True.
+    Otherwise, uses static username/password from config["auth"].
+
+    Args:
+        username: MySQL username
+        password: MySQL password (may be bytes or str, or OSCAR API key when enabled)
+        scramble_func: MySQL password scramble function
+        salt: MySQL auth salt
+        company_id: Company/tenant ID (unused in current implementation)
+        config: Full MindsDB config dict
+        client_address: Optional tuple (ip, port) from mysql_proxy.self.client_address
+
+    Returns:
+        Dict with keys:
+        - success: True/False
+        - username: Authenticated username (if success)
+        - user_id: Optional OSCAR user UUID (if OSCAR auth enabled)
+        - user_type: Optional 'user'/'system' (if OSCAR auth enabled)
+        - msg: Error message (if failure)
+    """
+    # PRD-MySQL-Auth: Route to OSCAR auth when enabled
+    oscar_auth_config = config.get("oscar_mysql_auth", {})
+    if oscar_auth_config.get("enabled"):
+        try:
+            from mindsdb.api.common.oscar_auth import check_oscar_auth
+
+            # Get client host from address tuple
+            client_host = "unknown"
+            if client_address:
+                try:
+                    client_host = client_address[0] if isinstance(client_address, tuple) else str(client_address)
+                except (IndexError, TypeError):
+                    pass
+
+            # Password field contains OSCAR API key when OSCAR auth is enabled
+            # Byte handling is done inside check_oscar_auth for consistent generic errors
+            return check_oscar_auth(
+                username=username,
+                api_key=password,
+                config=oscar_auth_config,
+                client_host=client_host,
+            )
+        except ImportError as e:
+            logger.error(f"[OSCAR_AUTH] Failed to import oscar_auth module: {e}")
+            # SECURITY: Return generic error to prevent information leakage
+            # Sanitize username/host to match PRP format exactly
+            safe_user = username if username else ""
+            return {
+                "success": False,
+                "msg": f"Access denied for user '{safe_user}'@'{client_host}' (using password: YES)",
+            }
+        except Exception as e:
+            logger.exception(f"[OSCAR_AUTH] Unexpected error in OSCAR auth: {e}")
+            # SECURITY: Return generic error to prevent information leakage
+            # Sanitize username/host to match PRP format exactly
+            safe_user = username if username else ""
+            return {
+                "success": False,
+                "msg": f"Access denied for user '{safe_user}'@'{client_host}' (using password: YES)",
+            }
+
+    # Existing static auth logic (when OSCAR auth disabled)
     try:
         hardcoded_user = config["auth"].get("username")
         hardcoded_password = config["auth"].get("password")
@@ -102,3 +167,4 @@ def check_auth(username, password, scramble_func, salt, company_id, config):
         return {"success": True, "username": username}
     except Exception:
         logger.exception(f"Check auth, user={username}: ERROR")
+        return {"success": False}

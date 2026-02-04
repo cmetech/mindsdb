@@ -238,7 +238,58 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
 
         username = handshake_resp.username.value.decode()
 
-        if client_auth_plugin != DEFAULT_AUTH_METHOD:
+        # PRD-MySQL-Auth: When OSCAR auth is enabled, get plaintext API key
+        oscar_auth_enabled = False
+        try:
+            oscar_auth_config = self.server.mindsdb_config.get("oscar_mysql_auth", {})
+            oscar_auth_enabled = oscar_auth_config.get("enabled", False)
+        except Exception as e:
+            logger.exception(f"[OSCAR_AUTH] Failed to read OSCAR auth config: {e}")
+            # Fail closed - return error to client
+            self.packet(
+                ErrPacket,
+                err_code=ERR.ER_ACCESS_DENIED_ERROR,
+                msg=f"Access denied for user '{username}' (internal error)",
+            ).send()
+            return False
+
+        if oscar_auth_enabled:
+            try:
+                if self.session.is_ssl:
+                    # SSL connection: use caching_sha2_password fast auth (supported by all GUI tools)
+                    logger.debug(
+                        f"Check auth, user={username}, ssl={self.session.is_ssl}, auth_method={client_auth_plugin}: "
+                        "OSCAR auth enabled (SSL), using fast auth for plaintext API key"
+                    )
+                    # Request fast auth which sends plaintext over encrypted connection
+                    password = get_fast_auth_password()
+                else:
+                    # Non-SSL: try mysql_clear_password (works with CLI, may fail with some GUI tools)
+                    logger.debug(
+                        f"Check auth, user={username}, ssl={self.session.is_ssl}, auth_method={client_auth_plugin}: "
+                        "OSCAR auth enabled (no SSL), switching to mysql_clear_password for API key"
+                    )
+                    password = switch_auth("mysql_clear_password")
+                    # Decode bytes to string for API key validation
+                    if isinstance(password, bytes):
+                        try:
+                            password = password.decode("utf-8")
+                        except UnicodeDecodeError:
+                            logger.warning(f"[OSCAR_AUTH] Failed to decode password as UTF-8 for user {username}")
+                            password = password  # Let oscar_auth handle the error
+                    # Remove null terminator if present
+                    if isinstance(password, str) and password.endswith("\x00"):
+                        password = password[:-1]
+            except Exception as e:
+                logger.exception(f"[OSCAR_AUTH] Exception during auth handshake for user '{username}': {e}")
+                # Fail closed - return error to client instead of hanging
+                self.packet(
+                    ErrPacket,
+                    err_code=ERR.ER_ACCESS_DENIED_ERROR,
+                    msg=f"Access denied for user '{username}' (authentication error)",
+                ).send()
+                return False
+        elif client_auth_plugin != DEFAULT_AUTH_METHOD:
             if client_auth_plugin == "mysql_native_password":
                 password = switch_auth("mysql_native_password")
             else:
@@ -307,17 +358,27 @@ class MysqlProxy(SocketServer.BaseRequestHandler):
             f"connecting to database {self.session.database}"
         )
 
-        auth_data = self.server.check_auth(username, password, scramble_func, self.salt, ctx.company_id)
+        # PRD-MySQL-Auth: Pass client_address for OSCAR auth logging
+        auth_data = self.server.check_auth(
+            username, password, scramble_func, self.salt, ctx.company_id, client_address=self.client_address
+        )
         if auth_data["success"]:
             self.session.username = auth_data["username"]
+            # PRD-MySQL-Auth: Store additional user context if available
+            if auth_data.get("user_id"):
+                self.session.user_id = auth_data.get("user_id")
+            if auth_data.get("user_type"):
+                self.session.user_type = auth_data.get("user_type")
             self.session.auth = True
             self.packet(OkPacket).send()
             return True
         else:
+            # PRD-MySQL-Auth: Use custom error message if provided
+            error_msg = auth_data.get("msg", f"Access denied for user {username}")
             self.packet(
                 ErrPacket,
                 err_code=ERR.ER_PASSWORD_NO_MATCH,
-                msg=f"Access denied for user {username}",
+                msg=error_msg,
             ).send()
             logger.warning(f"Access denied for user {username}")
             return False
