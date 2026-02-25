@@ -76,7 +76,7 @@ class PATAuthMiddleware(BaseHTTPMiddleware):
 
 
 # Used by mysql protocol
-def check_auth(username, password, scramble_func, salt, company_id, config, client_address=None):
+def check_auth(username, password, scramble_func, salt, company_id, user_id, config, client_address=None):
     """
     Authenticate MySQL protocol connections.
 
@@ -88,7 +88,8 @@ def check_auth(username, password, scramble_func, salt, company_id, config, clie
         password: MySQL password (may be bytes or str, or OSCAR API key when enabled)
         scramble_func: MySQL password scramble function
         salt: MySQL auth salt
-        company_id: Company/tenant ID (unused in current implementation)
+        company_id: Company/tenant ID
+        user_id: User ID from context
         config: Full MindsDB config dict
         client_address: Optional tuple (ip, port) from mysql_proxy.self.client_address
 
@@ -96,7 +97,8 @@ def check_auth(username, password, scramble_func, salt, company_id, config, clie
         Dict with keys:
         - success: True/False
         - username: Authenticated username (if success)
-        - user_id: Optional OSCAR user UUID (if OSCAR auth enabled)
+        - company_id: Company ID (if success)
+        - user_id: User UUID (if success, from context or OSCAR auth)
         - user_type: Optional 'user'/'system' (if OSCAR auth enabled)
         - msg: Error message (if failure)
     """
@@ -125,7 +127,6 @@ def check_auth(username, password, scramble_func, salt, company_id, config, clie
         except ImportError as e:
             logger.error(f"[OSCAR_AUTH] Failed to import oscar_auth module: {e}")
             # SECURITY: Return generic error to prevent information leakage
-            # Sanitize username/host to match PRP format exactly
             safe_user = username if username else ""
             return {
                 "success": False,
@@ -134,7 +135,6 @@ def check_auth(username, password, scramble_func, salt, company_id, config, clie
         except Exception as e:
             logger.exception(f"[OSCAR_AUTH] Unexpected error in OSCAR auth: {e}")
             # SECURITY: Return generic error to prevent information leakage
-            # Sanitize username/host to match PRP format exactly
             safe_user = username if username else ""
             return {
                 "success": False,
@@ -164,7 +164,7 @@ def check_auth(username, password, scramble_func, salt, company_id, config, clie
             return {"success": False}
 
         logger.info(f"Check auth, user={username}: Ok")
-        return {"success": True, "username": username}
+        return {"success": True, "username": username, "company_id": company_id, "user_id": user_id}
     except Exception:
         logger.exception(f"Check auth, user={username}: ERROR")
         return {"success": False}
