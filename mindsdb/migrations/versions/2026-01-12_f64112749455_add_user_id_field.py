@@ -4,6 +4,7 @@ Revision ID: f64112749455
 Revises: 86b172b78a5b
 Create Date: 2026-01-12 14:52:20.431290
 
+OSCAR Customization: Used String(255) instead of String() for MySQL compatibility.
 """
 
 import re
@@ -383,10 +384,11 @@ def upgrade():
     # Add user_id column and make company_id non-nullable with default DEFAULT_COMPANY_ID for all tables
     for table_name in TABLES_WITH_USER_ID:
         with op.batch_alter_table(table_name, schema=None) as batch_op:
-            batch_op.add_column(sa.Column("user_id", sa.String(), nullable=False, server_default=DEFAULT_USER_ID))
+            # OSCAR: Use String(255) instead of String() for MySQL compatibility
+            batch_op.add_column(sa.Column("user_id", sa.String(255), nullable=False, server_default=DEFAULT_USER_ID))
             # Make company_id non-nullable with default DEFAULT_COMPANY_ID
             batch_op.alter_column(
-                "company_id", existing_type=sa.String(), nullable=False, server_default=DEFAULT_COMPANY_ID
+                "company_id", existing_type=sa.String(255), nullable=False, server_default=DEFAULT_COMPANY_ID
             )
 
     # Drop old unique constraints and create new ones with user_id
@@ -490,7 +492,8 @@ def downgrade():
         with op.batch_alter_table(table_name, schema=None) as batch_op:
             batch_op.drop_column("user_id")
             # Revert company_id to nullable without default
-            batch_op.alter_column("company_id", existing_type=sa.String(), nullable=True, server_default=None)
+            # OSCAR: Use String(255) instead of String() for MySQL compatibility
+            batch_op.alter_column("company_id", existing_type=sa.String(255), nullable=True, server_default=None)
 
     # Set company_id back to legacy 'None' value for records that had DEFAULT_COMPANY_ID
     for table_name in TABLES_WITH_USER_ID:
