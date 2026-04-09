@@ -2,10 +2,9 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 
 from mindsdb.integrations.libs.api_handler import APITable
-from mindsdb.integrations.utilities.sql_utils import extract_comparison_conditions
 from mindsdb.utilities import log
 from mindsdb_sql_parser import ast
-from mindsdb_sql_parser.ast import Star, Identifier
+from mindsdb_sql_parser.ast import Star, Identifier, BinaryOperation, Constant
 
 logger = log.getLogger(__name__)
 
@@ -91,10 +90,69 @@ def _build_promql(
     return inner
 
 
+def _walk_where(node) -> List[Tuple[str, str, str]]:
+    """
+    Recursively walk a WHERE AST node and return list of (op, col, val) tuples.
+
+    Supports all operators that extract_comparison_conditions handled
+    (=, !=, >, <, >=, <=) PLUS LIKE, NOT LIKE, and OR.
+
+    OR on the same column is combined into a single condition so that
+      meta_hostname LIKE '%web%' OR meta_hostname LIKE '%db%'
+    becomes  ('like', 'meta_hostname', '%web%|%db%')
+    which the caller converts to PromQL regex  meta_hostname=~".*web.*|.*db.*"
+    """
+    if node is None:
+        return []
+
+    if not isinstance(node, BinaryOperation):
+        return []
+
+    op = node.op.lower()
+
+    # AND: flatten both sides
+    if op == 'and':
+        return _walk_where(node.args[0]) + _walk_where(node.args[1])
+
+    # OR: combine same-column LIKE patterns; fall back to separate conditions
+    if op == 'or':
+        left = _walk_where(node.args[0])
+        right = _walk_where(node.args[1])
+        combined = list(left)
+        for r_op, r_col, r_val in right:
+            merged = False
+            for i, (l_op, l_col, l_val) in enumerate(combined):
+                if l_col == r_col and l_op == r_op and l_op in ('like', 'not like'):
+                    # Combine patterns: '%web%|%db%'
+                    combined[i] = (l_op, l_col, f"{l_val}|{r_val}")
+                    merged = True
+                    break
+            if not merged:
+                combined.append((r_op, r_col, r_val))
+        return combined
+
+    # Leaf comparison: =, !=, >, <, >=, <=, like, not like
+    _SUPPORTED = {'=', '!=', '>', '<', '>=', '<=', 'like', 'not like', 'in', 'not in'}
+    if op in _SUPPORTED and len(node.args) == 2:
+        left, right = node.args
+        if isinstance(left, Identifier) and isinstance(right, Constant):
+            col = left.parts[-1].lower()
+            val = str(right.value) if right.value is not None else ""
+            return [(op, col, val)]
+        if isinstance(right, Identifier) and isinstance(left, Constant):
+            col = right.parts[-1].lower()
+            val = str(left.value) if left.value is not None else ""
+            return [(op, col, val)]
+
+    return []
+
+
 def _parse_conditions(query: ast.Select) -> dict:
     """
-    Walks query.where via extract_comparison_conditions and separates
-    routing columns (metric, fn, start, ...) from PromQL label selectors.
+    Walks query.where and separates routing columns (metric, fn, start, ...)
+    from PromQL label selectors.
+
+    Supports =, !=, >, <, >=, <=, LIKE, NOT LIKE, and OR on label columns.
     """
     result = {
         "metric": None,
@@ -112,7 +170,7 @@ def _parse_conditions(query: ast.Select) -> dict:
     if query.where is None:
         return result
 
-    conditions = extract_comparison_conditions(query.where)
+    conditions = _walk_where(query.where)
 
     # operator mapping from SQL to PromQL
     op_map = {
@@ -149,6 +207,12 @@ def _parse_conditions(query: ast.Select) -> dict:
         else:
             # Everything else is a PromQL label selector
             promql_op = op_map.get(op, "=")
+            # Convert SQL LIKE wildcards to PromQL regex:
+            #   %web%  →  .*web.*
+            #   web%   →  web.*
+            #   _      →  . (single-char wildcard)
+            if op in ("like", "not like"):
+                val = val.replace(".", r"\.").replace("%", ".*").replace("_", ".")
             result["labels"][col] = (promql_op, val)
 
     return result
@@ -385,28 +449,18 @@ class PrometheusLabelsTable(APITable):
         return ["metric", "job", "instance", "datacenter", "environment"]
 
 
-class OscarRecordingRuleTable(APITable):
+class _NamedMetricTable(APITable):
     """
-    A pre-configured table for a specific OSCAR recording rule metric.
-
-    Each instance wraps one oscar:node:* metric and exposes it as a named
-    table in the victoriametrics database (visible in SHOW TABLES).
+    Base class for pre-configured tables that wrap a single PromQL metric.
 
     Behaviour:
       - Default:         range query (last 1h, 1m step)
       - WHERE time=      instant query at that timestamp
       - WHERE time_start / time_end / step:  custom range query
 
-    All other WHERE conditions are passed through as PromQL label selectors.
     The metric name is baked in — users do not need WHERE metric = '...'.
-
-    Examples:
-      SELECT * FROM victoriametrics.oscar_node_cpu_utilization
-        WHERE instance = 'server01:9100';
-
-      SELECT value, timestamp, instance
-        FROM victoriametrics.oscar_node_memory_utilization
-        WHERE instance LIKE 'prod.*' AND time_start = 'now-6h' AND step = '5m';
+    All other WHERE conditions are passed through as PromQL label selectors.
+    Subclasses override get_columns() to declare their specific label set.
     """
 
     def __init__(self, handler, metric_name: str):
@@ -429,11 +483,11 @@ class OscarRecordingRuleTable(APITable):
         )
 
         logger.debug(
-            f"[prometheus_handler] recording_rule table={self.metric_name} → PromQL: {promql}"
+            f"[prometheus_handler] named_metric table={self.metric_name} → PromQL: {promql}"
         )
 
         if params["time"]:
-            # Instant query
+            # Instant query — single value per series
             raw = self.handler.call_prometheus_api(
                 "/api/v1/query",
                 {"query": promql, "time": params["time"]},
@@ -441,7 +495,7 @@ class OscarRecordingRuleTable(APITable):
             )
             result_type = raw.get("data", {}).get("resultType", "vector")
         else:
-            # Range query (default)
+            # Range query — full time-series (user explicitly set step or using defaults)
             raw = self.handler.call_prometheus_api(
                 "/api/v1/query_range",
                 {
@@ -464,24 +518,332 @@ class OscarRecordingRuleTable(APITable):
         return _filter_columns(df, query)
 
     def get_columns(self) -> List[str]:
+        raise NotImplementedError
+
+
+class InfraRecordingRuleTable(_NamedMetricTable):
+    """
+    Pre-configured table for an infrastructure node recording rule metric.
+
+    Each instance wraps one infra:node:* derived metric and exposes it as a
+    named table in the victoriametrics database (visible in SHOW TABLES).
+
+    The mountpoint column is populated for infra_node_disk_utilization only;
+    it is returned as NA for all other metrics.
+
+    Examples:
+      SELECT * FROM victoriametrics.infra_node_cpu_utilization
+        WHERE meta_hostname = 'dc1-dev-web-01' AND time = 'now';
+
+      SELECT value, timestamp, meta_hostname
+        FROM victoriametrics.infra_node_memory_utilization
+        WHERE meta_hostname LIKE '%prod%'
+          AND time_start = 'now-6h'
+          AND step = '5m';
+
+      SELECT mountpoint, value FROM victoriametrics.infra_node_disk_utilization
+        WHERE meta_hostname = 'dc1-dev-app-01'
+          AND mountpoint = '/'
+          AND time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
         return [
             "metric", "value", "timestamp",
-            "instance", "job", "datacenter", "environment",
+            "instance", "job",
+            "meta_hostname", "meta_ipaddress",
+            "datacenter", "environment",
             "oscar_metric_type",
+            "mountpoint",  # populated for disk_utilization, NA for all others
+        ]
+
+
+class InfraAnomalyTable(_NamedMetricTable):
+    """
+    Pre-configured table for an anomaly detection metric.
+
+    Each instance wraps one anomaly:* metric (z-score, adaptive bands, level)
+    and exposes it as a named table in the victoriametrics database.
+
+    Filter by anomaly_name to select a specific node metric:
+      cpu_utilization, memory_utilization, swap_utilization, disk_utilization,
+      iowait_pct, load_per_cpu, network_rx_bytes_rate, network_tx_bytes_rate
+
+    The anomaly_method column is populated for anomaly_zscore only (value: 'zscore').
+
+    Examples:
+      -- Current z-scores above 3σ (critical anomalies)
+      SELECT instance, anomaly_name, value
+        FROM victoriametrics.anomaly_zscore
+        WHERE value = '> 3' AND time = 'now';
+
+      -- CPU z-score trend for one server
+      SELECT timestamp, value FROM victoriametrics.anomaly_zscore
+        WHERE anomaly_name = 'cpu_utilization'
+          AND meta_hostname = 'dc1-dev-web-01'
+          AND time_start = 'now-2h'
+          AND step = '1m';
+
+      -- Adaptive upper band for memory (Grafana context, not alerting)
+      SELECT instance, anomaly_name, value
+        FROM victoriametrics.anomaly_upper_band
+        WHERE anomaly_name = 'memory_utilization' AND time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "instance", "job",
+            "meta_hostname", "meta_ipaddress",
+            "datacenter", "environment",
+            "anomaly_name", "anomaly_strategy", "anomaly_type",
+            "anomaly_method",  # populated for anomaly_zscore only
         ]
 
 
 # ---------------------------------------------------------------------------
 # Registry: maps MindsDB table name → PromQL metric name
-# Add new OSCAR recording rules here as they are created.
+# Infrastructure node derived metrics (recording-oscar-node-derived.on.yml)
 # ---------------------------------------------------------------------------
-OSCAR_RECORDING_RULE_TABLES: Dict[str, str] = {
-    "oscar_node_cpu_utilization":      "oscar:node:cpu_utilization",
-    "oscar_node_memory_utilization":   "oscar:node:memory_utilization",
-    "oscar_node_swap_utilization":     "oscar:node:swap_utilization",
-    "oscar_node_disk_utilization":     "oscar:node:disk_utilization",
-    "oscar_node_iowait_pct":           "oscar:node:iowait_pct",
-    "oscar_node_load_per_cpu":         "oscar:node:load_per_cpu",
-    "oscar_node_network_rx_bytes_rate": "oscar:node:network_rx_bytes_rate",
-    "oscar_node_network_tx_bytes_rate": "oscar:node:network_tx_bytes_rate",
+INFRA_RECORDING_RULE_TABLES: Dict[str, str] = {
+    "infra_node_cpu_utilization":         "infra:node:cpu_utilization",
+    "infra_node_memory_utilization":      "infra:node:memory_utilization",
+    "infra_node_swap_utilization":        "infra:node:swap_utilization",
+    "infra_node_disk_utilization":        "infra:node:disk_utilization",
+    "infra_node_iowait_pct":              "infra:node:iowait_pct",
+    "infra_node_load_per_cpu":            "infra:node:load_per_cpu",
+    "infra_node_network_rx_bytes_rate":   "infra:node:network_rx_bytes_rate",
+    "infra_node_network_tx_bytes_rate":   "infra:node:network_tx_bytes_rate",
+}
+
+# ---------------------------------------------------------------------------
+# Registry: maps MindsDB table name → PromQL metric name
+# Anomaly detection metrics (recording-anomaly-zscore.on.yml +
+#                            recording-anomaly-adaptive.on.yml)
+# ---------------------------------------------------------------------------
+INFRA_ANOMALY_TABLES: Dict[str, str] = {
+    # Z-score anomaly detection — primary alerting metric
+    "anomaly_zscore":       "anomaly:zscore",
+    # Adaptive pipeline — filtered input value (same as the source metric, with anomaly labels)
+    "anomaly_level":        "anomaly:level",
+    # Adaptive bands — Grafana visualization only, not used for alerting
+    "anomaly_upper_band":   "anomaly:upper_band",
+    "anomaly_lower_band":   "anomaly:lower_band",
+}
+
+
+# ===========================================================================
+# OSCAR Platform Operational Tables
+# ===========================================================================
+# These tables expose real-time OSCAR service metrics scraped from the
+# oscar-monitor, oscar-alertmanager, oscar-taskmanager, and oscar-vector-gateway
+# Prometheus endpoints.  All source metrics are Gauges — they return meaningful
+# point-in-time values without requiring rate() or increase() transforms.
+# ===========================================================================
+
+class OscarContainerTable(_NamedMetricTable):
+    """
+    Active notification dispatch tasks from alertmanager_middleware.
+
+    Metric: oscar_alertmanager_active_notification_tasks
+    Value:  current count of in-flight notification tasks
+
+    Labels: (none — scalar Gauge)
+
+    Examples:
+      -- How many notification tasks are active right now?
+      SELECT value
+        FROM victoriametrics.oscar_alert_active_tasks
+        WHERE time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+        ]
+
+
+class OscarAlertQueueTable(_NamedMetricTable):
+    """
+    Alert queue depth or processing rate from oscar-alertmanager.
+
+    Metric: oscar_alert_queue_depth
+    Labels: queue  (queue name: tm_alerts, tm_notifier, etc.)
+
+    Examples:
+      -- Current depth of all alert queues
+      SELECT queue, value
+        FROM victoriametrics.oscar_alert_queue_depth
+        WHERE time = 'now';
+
+      -- Is there a queue backlog?
+      SELECT queue, value
+        FROM victoriametrics.oscar_alert_queue_depth
+        WHERE value = '> 0' AND time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "job", "instance",
+            "queue",
+        ]
+
+
+class OscarAlertCircuitBreakerTable(_NamedMetricTable):
+    """
+    Circuit breaker open/closed state from Celery task monitor or AI backends.
+
+    Metrics:
+      celery_monitor_circuit_breaker_open  — taskmanager Celery circuit breaker (0=closed, 1=open)
+      oscar_topic_classifier_backend_health — topic classifier backend health (1=healthy, 0=unhealthy)
+
+    Labels: job, instance, datacenter, environment
+
+    Examples:
+      -- Is the taskmanager circuit breaker open?
+      SELECT value, datacenter, environment
+        FROM victoriametrics.oscar_alert_circuit_breaker
+        WHERE time = 'now';
+
+      -- Is the topic classifier backend healthy?
+      SELECT value, datacenter, environment
+        FROM victoriametrics.oscar_topic_classifier_health
+        WHERE time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "job", "instance",
+            "datacenter", "environment",
+        ]
+
+
+class OscarAlertCounterTable(_NamedMetricTable):
+    """
+    Alert processing counters from alertmanager_middleware.
+
+    Metric: oscar_alertmanager_alerts_processed_total
+    Value:  cumulative count of alerts processed
+    Labels: status  (success, error)
+
+    Examples:
+      -- How many alerts have been processed total?
+      SELECT status, value
+        FROM victoriametrics.oscar_alert_processed
+        WHERE time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "status",
+        ]
+
+
+class OscarTaskTable(_NamedMetricTable):
+    """
+    Task execution metrics from oscar-taskmanager (Celery monitoring).
+
+    Used for:
+      oscar_task_history  → oscar_task_success              (Gauge pushed via pushgateway, per-task result)
+      oscar_task_rate     → celery_monitor_task_execution_rate  (Gauge, scalar tasks/sec)
+      oscar_task_workers  → celery_monitor_active_workers       (Gauge, scalar count)
+
+    Labels for oscar_task_history (oscar_task_success):
+      task_name, task_type, state (SUCCESS/FAILURE), meta_hostname, meta_component, meta_datacenter
+    No labels for oscar_task_rate and oscar_task_workers.
+
+    Examples:
+      -- Which tasks are failing?
+      SELECT task_name, task_type, state, meta_hostname, value
+        FROM victoriametrics.oscar_task_history
+        WHERE state = 'FAILURE' AND time = 'now';
+
+      -- All task execution results grouped by task name
+      SELECT task_name, state, value
+        FROM victoriametrics.oscar_task_history
+        WHERE time = 'now';
+
+      -- Current task execution rate (tasks/sec)
+      SELECT value FROM victoriametrics.oscar_task_rate
+        WHERE time = 'now';
+
+      -- Active worker count
+      SELECT value FROM victoriametrics.oscar_task_workers
+        WHERE time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "task_name", "task_type", "state",
+            "meta_hostname", "meta_component", "meta_datacenter",
+            "job", "instance",
+        ]
+
+
+class OscarVectorTable(_NamedMetricTable):
+    """
+    Notifier delivery failure metrics from oscar-notifier.
+
+    Metric: oscar_notifier_failed_total
+    Value:  cumulative count of failed notification deliveries
+    Labels: notifier_name, notifier_type, namespace, error_type, provider
+
+    Examples:
+      -- Which notifiers are failing?
+      SELECT notifier_name, notifier_type, error_type, provider, value
+        FROM victoriametrics.oscar_notifier_failed
+        WHERE time = 'now';
+
+      -- Failures by error type
+      SELECT error_type, value
+        FROM victoriametrics.oscar_notifier_failed
+        WHERE time = 'now';
+    """
+
+    def get_columns(self) -> List[str]:
+        return [
+            "metric", "value", "timestamp",
+            "notifier_name", "notifier_type",
+            "namespace", "error_type", "provider",
+            "job", "instance",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Registry: maps MindsDB table name → PromQL metric name
+# OSCAR platform operational metrics — all Gauges, no recording rules needed
+# ---------------------------------------------------------------------------
+
+OSCAR_PLATFORM_TABLES: Dict[str, str] = {
+    # alertmanager_middleware: active in-flight notification dispatch tasks
+    "oscar_alert_active_tasks":     "oscar_alertmanager_active_notification_tasks",
+}
+
+OSCAR_ALERT_TABLES: Dict[str, str] = {
+    # alertmanager_middleware: live queue depth per Celery queue
+    "oscar_alert_queue_depth":      "oscar_alert_queue_depth",
+    # alertmanager_middleware: cumulative alerts processed by status (success/error)
+    "oscar_alert_processed":        "oscar_alertmanager_alerts_processed_total",
+    # taskmanager celery monitor: circuit breaker open/closed (0=closed, 1=open)
+    "oscar_alert_circuit_breaker":  "celery_monitor_circuit_breaker_open",
+}
+
+OSCAR_TASK_TABLES: Dict[str, str] = {
+    # taskmanager pushgateway: per-task execution result (state=SUCCESS/FAILURE, 80+ series)
+    "oscar_task_history":   "oscar_task_success",
+    # taskmanager: task execution rate (tasks/sec over last 5 min)
+    "oscar_task_rate":      "celery_monitor_task_execution_rate",
+    # taskmanager: number of active Celery workers
+    "oscar_task_workers":   "celery_monitor_active_workers",
+}
+
+OSCAR_SERVICE_TABLES: Dict[str, str] = {
+    # oscar-notifier: cumulative failed notification deliveries with error details
+    "oscar_notifier_failed":         "oscar_notifier_failed_total",
+    # middleware: topic classifier AI backend health (1=healthy, 0=unhealthy)
+    "oscar_topic_classifier_health": "oscar_topic_classifier_backend_health",
 }

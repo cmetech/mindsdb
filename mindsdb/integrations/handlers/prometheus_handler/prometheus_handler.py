@@ -10,8 +10,20 @@ from .prometheus_tables import (
     PrometheusRangeTable,
     PrometheusMetricsTable,
     PrometheusLabelsTable,
-    OscarRecordingRuleTable,
-    OSCAR_RECORDING_RULE_TABLES,
+    InfraRecordingRuleTable,
+    InfraAnomalyTable,
+    OscarContainerTable,
+    OscarAlertQueueTable,
+    OscarAlertCircuitBreakerTable,
+    OscarAlertCounterTable,
+    OscarTaskTable,
+    OscarVectorTable,
+    INFRA_RECORDING_RULE_TABLES,
+    INFRA_ANOMALY_TABLES,
+    OSCAR_PLATFORM_TABLES,
+    OSCAR_ALERT_TABLES,
+    OSCAR_TASK_TABLES,
+    OSCAR_SERVICE_TABLES,
     _victoriametrics_result_to_df,
 )
 
@@ -36,15 +48,32 @@ class PrometheusHandler(APIHandler):
       metrics      - Metric name discovery via /api/v1/label/__name__/values
       labels       - Label discovery via /api/v1/series
 
-    OSCAR recording rule tables (each maps to one pre-computed metric):
-      oscar_node_cpu_utilization       - CPU usage %
-      oscar_node_memory_utilization    - Memory usage % (excl. buffers/cache)
-      oscar_node_swap_utilization      - Swap usage %
-      oscar_node_disk_utilization      - Disk usage % per mountpoint
-      oscar_node_iowait_pct            - I/O wait %
-      oscar_node_load_per_cpu          - Load average / vCPU count
-      oscar_node_network_rx_bytes_rate - Network receive bytes/s
-      oscar_node_network_tx_bytes_rate - Network transmit bytes/s
+    Infrastructure node tables (each maps to one pre-computed derived metric):
+      infra_node_cpu_utilization         - CPU usage %
+      infra_node_memory_utilization      - Memory usage % (excl. buffers/cache)
+      infra_node_swap_utilization        - Swap usage %
+      infra_node_disk_utilization        - Disk usage % per mountpoint (+ mountpoint col)
+      infra_node_iowait_pct              - I/O wait %
+      infra_node_load_per_cpu            - Load average / vCPU count
+      infra_node_network_rx_bytes_rate   - Network receive bytes/s
+      infra_node_network_tx_bytes_rate   - Network transmit bytes/s
+
+    Anomaly detection tables (z-score alerting + adaptive band visualisation):
+      anomaly_zscore     - Z-score per metric/instance (primary alert signal)
+      anomaly_level      - Filtered input value with anomaly labels
+      anomaly_upper_band - Adaptive upper band (mean + 2σ, Grafana only)
+      anomaly_lower_band - Adaptive lower band (mean − 2σ, Grafana only)
+
+    OSCAR platform operational tables (Gauges/Counters scraped from live services):
+      oscar_alert_active_tasks    - Active in-flight notification dispatch tasks (scalar)
+      oscar_alert_queue_depth     - Live alert queue depth per Celery queue
+      oscar_alert_processed       - Cumulative alerts processed by status (success/error)
+      oscar_alert_circuit_breaker - Celery taskmanager circuit breaker state (0=closed, 1=open)
+      oscar_task_history          - Per-task execution results via pushgateway (80+ series)
+      oscar_task_rate             - Task execution rate (tasks/sec, 5-min avg)
+      oscar_task_workers          - Active Celery worker count
+      oscar_notifier_failed       - Failed notification deliveries by notifier/error_type
+      oscar_topic_classifier_health - Topic classifier AI backend health (1=healthy, 0=unhealthy)
     """
 
     name = "prometheus"
@@ -70,11 +99,37 @@ class PrometheusHandler(APIHandler):
         self._register_table("metrics",      PrometheusMetricsTable(self))
         self._register_table("labels",       PrometheusLabelsTable(self))
 
-        # OSCAR recording rule tables — one table per derived metric.
+        # Infrastructure node tables — one table per derived metric.
         # Each table name maps to the PromQL recording rule metric defined in
         # oscar-metricstore/vmalert/rules/recording-oscar-node-derived.on.yml
-        for table_name, metric_name in OSCAR_RECORDING_RULE_TABLES.items():
-            self._register_table(table_name, OscarRecordingRuleTable(self, metric_name))
+        for table_name, metric_name in INFRA_RECORDING_RULE_TABLES.items():
+            self._register_table(table_name, InfraRecordingRuleTable(self, metric_name))
+
+        # Anomaly detection tables — z-score + adaptive band metrics.
+        # Defined in recording-anomaly-zscore.on.yml + recording-anomaly-adaptive.on.yml
+        for table_name, metric_name in INFRA_ANOMALY_TABLES.items():
+            self._register_table(table_name, InfraAnomalyTable(self, metric_name))
+
+        # OSCAR platform operational tables — Gauges/Counters from live OSCAR services.
+        for table_name, metric_name in OSCAR_PLATFORM_TABLES.items():
+            self._register_table(table_name, OscarContainerTable(self, metric_name))
+
+        for table_name, metric_name in OSCAR_ALERT_TABLES.items():
+            if metric_name == "oscar_alertmanager_alerts_processed_total":
+                self._register_table(table_name, OscarAlertCounterTable(self, metric_name))
+            elif metric_name == "celery_monitor_circuit_breaker_open":
+                self._register_table(table_name, OscarAlertCircuitBreakerTable(self, metric_name))
+            else:
+                self._register_table(table_name, OscarAlertQueueTable(self, metric_name))
+
+        for table_name, metric_name in OSCAR_TASK_TABLES.items():
+            self._register_table(table_name, OscarTaskTable(self, metric_name))
+
+        for table_name, metric_name in OSCAR_SERVICE_TABLES.items():
+            if metric_name == "oscar_topic_classifier_backend_health":
+                self._register_table(table_name, OscarAlertCircuitBreakerTable(self, metric_name))
+            else:
+                self._register_table(table_name, OscarVectorTable(self, metric_name))
 
     def connect(self) -> requests.Session:
         if self.is_connected and self._session:

@@ -25,7 +25,7 @@ SHOW DATABASES;
 SHOW TABLES FROM victoriametrics;
 ```
 
-> **Tables available:** `instant`, `range_query`, `metrics`, `labels` + 8 named OSCAR node tables (see below)
+> **Tables available:** `instant`, `range_query`, `metrics`, `labels` + 8 named infra node tables + 4 anomaly tables (see below)
 
 ---
 
@@ -37,14 +37,18 @@ SHOW TABLES FROM victoriametrics;
 | `range_query` | Generic | One row per (series × timestamp) | Trends/history for any metric |
 | `metrics` | Discovery | One row per metric name | What metrics exist in VictoriaMetrics |
 | `labels` | Discovery | One row per label combination | What labels/values a metric has |
-| `oscar_node_cpu_utilization` | Named | One row per (instance × timestamp) | CPU usage % — no `WHERE metric` needed |
-| `oscar_node_memory_utilization` | Named | One row per (instance × timestamp) | Memory usage % (excl. buffers/cache) |
-| `oscar_node_swap_utilization` | Named | One row per (instance × timestamp) | Swap usage % |
-| `oscar_node_disk_utilization` | Named | One row per (instance × mountpoint × timestamp) | Disk usage % per mountpoint |
-| `oscar_node_iowait_pct` | Named | One row per (instance × timestamp) | I/O wait % |
-| `oscar_node_load_per_cpu` | Named | One row per (instance × timestamp) | Load average per vCPU |
-| `oscar_node_network_rx_bytes_rate` | Named | One row per (instance × timestamp) | Network RX bytes/s |
-| `oscar_node_network_tx_bytes_rate` | Named | One row per (instance × timestamp) | Network TX bytes/s |
+| `infra_node_cpu_utilization` | Named | One row per (instance × timestamp) | CPU usage % — no `WHERE metric` needed |
+| `infra_node_memory_utilization` | Named | One row per (instance × timestamp) | Memory usage % (excl. buffers/cache) |
+| `infra_node_swap_utilization` | Named | One row per (instance × timestamp) | Swap usage % |
+| `infra_node_disk_utilization` | Named | One row per (instance × mountpoint × timestamp) | Disk usage % per mountpoint (+ `mountpoint` col) |
+| `infra_node_iowait_pct` | Named | One row per (instance × timestamp) | I/O wait % |
+| `infra_node_load_per_cpu` | Named | One row per (instance × timestamp) | Load average per vCPU |
+| `infra_node_network_rx_bytes_rate` | Named | One row per (instance × timestamp) | Network RX bytes/s |
+| `infra_node_network_tx_bytes_rate` | Named | One row per (instance × timestamp) | Network TX bytes/s |
+| `anomaly_zscore` | Named | One row per (instance × anomaly_name × timestamp) | Z-score — primary anomaly signal (±2σ major, ±3σ critical) |
+| `anomaly_level` | Named | One row per (instance × anomaly_name × timestamp) | Filtered input value with anomaly labels |
+| `anomaly_upper_band` | Named | One row per (instance × anomaly_name × timestamp) | Adaptive upper band — Grafana visualisation |
+| `anomaly_lower_band` | Named | One row per (instance × anomaly_name × timestamp) | Adaptive lower band — Grafana visualisation |
 
 ---
 
@@ -79,8 +83,24 @@ SHOW TABLES FROM victoriametrics;
 |-------------|----------------|---------|
 | `= 'value'` | `="value"` | Exact match |
 | `!= 'value'` | `!="value"` | Exclude exact match |
-| `LIKE 'pattern'` | `=~"pattern"` | Regex match |
+| `LIKE 'pattern'` | `=~"pattern"` | Regex match (see wildcard conversion below) |
 | `NOT LIKE 'pattern'` | `!~"pattern"` | Regex exclude |
+
+#### SQL LIKE Wildcard → PromQL Regex Conversion
+
+SQL `LIKE` uses `%` (any chars) and `_` (any single char). PromQL uses regex (`.*` and `.`).
+The handler **automatically converts** SQL wildcards to PromQL regex — you never need to write `.*` yourself.
+
+| SQL LIKE pattern | PromQL regex produced | Matches |
+|-----------------|----------------------|---------|
+| `LIKE '%web%'` | `=~".*web.*"` | Any hostname containing "web" |
+| `LIKE 'db-%'` | `=~"db\-.*"` | Hostnames starting with "db-" |
+| `LIKE '%prod'` | `=~".*prod"` | Hostnames ending in "prod" |
+| `LIKE 'web_server%'` | `=~"web.server.*"` | web1server, web-server, etc. |
+| `NOT LIKE '%test%'` | `!~".*test.*"` | Exclude anything containing "test" |
+
+> **Tip for AI-generated queries:** Always use `LIKE '%partial_name%'` for hostname matching.
+> Never write raw regex like `LIKE '.*web.*'` — the `%` wildcard is cleaner and auto-converted.
 
 ### Supported `fn` Values
 
@@ -753,23 +773,42 @@ docker logs oscar-kore --tail 50 -f | grep prometheus_handler
 > Each `oscar:node:*` recording rule has a **dedicated named table** — no `WHERE metric = ...` required.
 > The metric is baked into the table. All other WHERE conditions become PromQL label selectors.
 >
-> **Default behaviour (no time params):** range query, last 1 hour, 1-minute step.
-> **Instant query:** add `WHERE time = 'now'` (or any RFC3339 / Unix timestamp).
+> **Default behaviour (no time params):** range query from `now-1h` to `now` at `1m` step — returns ~60 rows per server.
+> **Instant snapshot (1 row per server):** `WHERE time = 'now'`
+> **Averaged single value:** `WHERE fn = 'avg_over_time' AND fn_window = '30m' AND time = 'now'`
+> **Trend chart:** `WHERE time_start = 'now-1h' AND step = '5m'`
 
 ### Named Table Reference
 
 | SQL Table | PromQL Metric | Key Labels |
 |-----------|--------------|------------|
-| `oscar_node_cpu_utilization` | `oscar:node:cpu_utilization` | `instance` |
-| `oscar_node_memory_utilization` | `oscar:node:memory_utilization` | `instance` |
-| `oscar_node_swap_utilization` | `oscar:node:swap_utilization` | `instance` |
-| `oscar_node_disk_utilization` | `oscar:node:disk_utilization` | `instance`, `mountpoint` |
-| `oscar_node_iowait_pct` | `oscar:node:iowait_pct` | `instance` |
-| `oscar_node_load_per_cpu` | `oscar:node:load_per_cpu` | `instance` |
-| `oscar_node_network_rx_bytes_rate` | `oscar:node:network_rx_bytes_rate` | `instance` |
-| `oscar_node_network_tx_bytes_rate` | `oscar:node:network_tx_bytes_rate` | `instance` |
+| `infra_node_cpu_utilization` | `infra:node:cpu_utilization` | `instance` |
+| `infra_node_memory_utilization` | `infra:node:memory_utilization` | `instance` |
+| `infra_node_swap_utilization` | `infra:node:swap_utilization` | `instance` |
+| `infra_node_disk_utilization` | `infra:node:disk_utilization` | `instance`, `mountpoint` |
+| `infra_node_iowait_pct` | `infra:node:iowait_pct` | `instance` |
+| `infra_node_load_per_cpu` | `infra:node:load_per_cpu` | `instance` |
+| `infra_node_network_rx_bytes_rate` | `infra:node:network_rx_bytes_rate` | `instance` |
+| `infra_node_network_tx_bytes_rate` | `infra:node:network_tx_bytes_rate` | `instance` |
 
-**Common columns on all named tables:** `metric`, `value`, `timestamp`, `instance`, `job`, `datacenter`, `environment`, `oscar_metric_type`
+**Columns on all named tables:**
+
+| Column | Description | Example value |
+|--------|-------------|---------------|
+| `metric` | PromQL metric name | `infra:node:cpu_utilization` |
+| `value` | Metric value (float) | `72.4` |
+| `timestamp` | Unix timestamp of the sample | `1741737600` |
+| `instance` | Scrape target (`ip:port`) | `10.0.1.10:9100` |
+| `job` | Prometheus scrape job name | `node` |
+| `meta_hostname` | Human-readable server hostname (set by vmagent) | `web-server-01` |
+| `meta_ipaddress` | Server IP address (set by vmagent) | `10.0.1.10` |
+| `datacenter` | Datacenter label (set by vmagent) | `dc1` |
+| `environment` | Environment label (set by vmagent) | `production` |
+| `oscar_metric_type` | Always `derived` for these tables | `derived` |
+
+> **`meta_hostname` and `meta_ipaddress`** are the preferred columns for server filtering.
+> `instance` is the raw `ip:port` scrape target — less readable in natural language queries.
+> Always prefer `meta_hostname LIKE '%server-name%'` over `instance LIKE '%ip%'`.
 
 ---
 
@@ -777,110 +816,229 @@ docker logs oscar-kore --tail 50 -f | grep prometheus_handler
 
 > **Note — `value` in WHERE is a PromQL threshold filter, not a column filter.**
 > `WHERE value = '> 80'` appends `> 80` to the PromQL expression, so only time series
-> where the current value exceeds 80 are returned.  If no series match (e.g. all nodes
-> have swap = 0), the result is an empty table — this is correct behaviour, not an error.
-> All declared columns (`instance`, `value`, `timestamp`, etc.) are always present in the
-> result even when empty.
+> where the current value exceeds 80 are returned. If no series match the result is an
+> empty table — correct behaviour, not an error.
 
-#### Current CPU % across all nodes
+---
+
+### Query Mode Reference — How Time Parameters Control Results
+
+This is critical for correct queries. The result shape depends entirely on what time parameters you provide:
+
+| WHERE params provided | Query fired | Result shape | Use when... |
+|----------------------|------------|-------------|-------------|
+| `time = 'now'` | Instant snapshot at now | 1 row per server | "what is CPU right now?" |
+| `time = '<timestamp>'` | Instant snapshot at that time | 1 row per server | point-in-time lookup |
+| `time_start = 'now-Xm'` | Range query, step=1m | ~X rows per server | exploratory, recent trend |
+| `time_start + step = '5m'` | Range query, step=5m | fewer rows per server | trend charts |
+| `fn = 'avg_over_time' AND fn_window = '30m' AND time = 'now'` | Instant with avg_over_time | **1 averaged row per server** | "what was avg CPU over last 30m?" |
+| `fn = 'max_over_time' AND fn_window = '6h' AND time = 'now'` | Instant with max_over_time | **1 peak row per server** | "what was peak CPU in last 6h?" |
+| No params | Range query (last 1h, 1m step) | ~60 rows per server | exploratory/dashboard |
+
+**Key rules for natural language queries:**
+
+| User says | Correct SQL pattern | Why |
+|-----------|-------------------|-----|
+| "what is CPU right now?" | `WHERE time = 'now'` | instant snapshot |
+| "average CPU over last 30 mins" | `WHERE fn = 'avg_over_time' AND fn_window = '30m' AND time = 'now'` | explicit aggregation |
+| "peak CPU in last 6 hours" | `WHERE fn = 'max_over_time' AND fn_window = '6h' AND time = 'now'` | explicit aggregation |
+| "show CPU trend last 30 mins" | `WHERE time_start = 'now-30m' AND step = '5m'` | time series |
+| "was CPU high last night?" | `WHERE time_start = 'now-12h' AND step = '15m'` | time series |
+
+> **SQL OR precedence — always use parentheses with OR:**
+> `WHERE A OR B AND C` is parsed as `WHERE A OR (B AND C)` by SQL — not `(A OR B) AND C`.
+> Always wrap OR conditions in parentheses when combining with AND:
+> ```sql
+> -- CORRECT
+> WHERE (meta_hostname LIKE '%web%' OR meta_hostname LIKE '%db%')
+>   AND time_start = 'now-1h'
+>
+> -- WRONG — time_start only applies to the %db% branch
+> WHERE meta_hostname LIKE '%web%' OR meta_hostname LIKE '%db%'
+>   AND time_start = 'now-1h'
+> ```
+
+---
+
+### Named Table Query Examples
+
+#### Current snapshot — all servers
 
 ```sql
-SELECT * FROM victoriametrics.oscar_node_cpu_utilization
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_cpu_utilization
 WHERE time = 'now';
 
--- PromQL: oscar:node:cpu_utilization  (instant, current)
+-- PromQL: infra:node:cpu_utilization  (instant)
+-- Returns: 1 row per server, current value
 ```
 
-#### CPU trend — last 6 hours, 5-minute resolution
+#### Average CPU over last 30 minutes — all servers (1 row per server)
 
 ```sql
-SELECT instance, timestamp, value FROM victoriametrics.oscar_node_cpu_utilization
-WHERE time_start = 'now-6h'
-  AND time_end = 'now'
+SELECT meta_hostname, meta_ipaddress, environment, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE fn = 'avg_over_time'
+  AND fn_window = '30m'
+  AND time = 'now';
+
+-- PromQL: avg_over_time(infra:node:cpu_utilization[30m])  (instant at now)
+-- Returns: 1 averaged row per server
+```
+
+#### Average CPU over last 1 hour — web servers only (1 row per server)
+
+```sql
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE meta_hostname LIKE '%web%'
+  AND fn = 'avg_over_time'
+  AND fn_window = '1h'
+  AND time = 'now';
+
+-- PromQL: avg_over_time(infra:node:cpu_utilization{meta_hostname=~".*web.*"}[1h])
+-- Returns: 1 averaged row per web server
+```
+
+#### Average CPU last 30 minutes — two specific servers by name
+
+```sql
+-- IMPORTANT: wrap OR in parentheses so AND applies to both branches
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE (meta_hostname LIKE '%web-server-01%' OR meta_hostname LIKE '%db-server-01%')
+  AND fn = 'avg_over_time'
+  AND fn_window = '30m'
+  AND time = 'now';
+
+-- PromQL: avg_over_time(infra:node:cpu_utilization{meta_hostname=~".*web-server-01.*|.*db-server-01.*"}[30m])
+-- Returns: 1 row for web-server-01, 1 row for db-server-01
+```
+
+#### CPU trend (time series) — for charting
+
+```sql
+SELECT meta_hostname, timestamp, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE meta_hostname LIKE '%web-server-01%'
+  AND time_start = 'now-1h'
   AND step = '5m';
 
--- PromQL: oscar:node:cpu_utilization  (start=now-6h, end=now, step=5m)
+-- PromQL: infra:node:cpu_utilization{meta_hostname=~".*web-server-01.*"}
+-- Returns: 12 rows (one per 5 minutes) — use for trend charts
 ```
 
-#### Filter to a specific server
+#### Peak CPU over last 6 hours — 1 row per server
 
 ```sql
-SELECT * FROM victoriametrics.oscar_node_cpu_utilization
-WHERE instance = 'server01:9100'
-  AND time_start = 'now-1h'
-  AND step = '1m';
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE fn = 'max_over_time'
+  AND fn_window = '6h'
+  AND time = 'now';
 
--- PromQL: oscar:node:cpu_utilization{instance="server01:9100"}
+-- PromQL: max_over_time(infra:node:cpu_utilization[6h])
+-- Returns: 1 row per server — the peak value over 6 hours
 ```
 
-#### Nodes with CPU above 80% right now
+#### Servers with CPU above 80% right now
 
 ```sql
-SELECT instance, value FROM victoriametrics.oscar_node_cpu_utilization
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_cpu_utilization
 WHERE time = 'now'
   AND value = '> 80';
 
--- PromQL: oscar:node:cpu_utilization > 80
+-- PromQL: infra:node:cpu_utilization > 80
 ```
 
-#### Memory usage — current snapshot
+#### Filter by environment — average over last 30 minutes
 
 ```sql
-SELECT * FROM victoriametrics.oscar_node_memory_utilization
-WHERE time = 'now';
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE environment = 'production'
+  AND fn = 'avg_over_time'
+  AND fn_window = '30m'
+  AND time = 'now';
 
--- PromQL: oscar:node:memory_utilization
+-- Returns 1 averaged row per production server
+```
+
+#### Memory — average over last 1 hour (1 row per server)
+
+```sql
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_memory_utilization
+WHERE fn = 'avg_over_time'
+  AND fn_window = '1h'
+  AND time = 'now';
+
+-- PromQL: avg_over_time(infra:node:memory_utilization[1h])
 ```
 
 #### Disk usage per mountpoint — all above 70%
 
 ```sql
-SELECT instance, mountpoint, value FROM victoriametrics.oscar_node_disk_utilization
+SELECT meta_hostname, mountpoint, value
+FROM victoriametrics.infra_node_disk_utilization
 WHERE time = 'now'
   AND value = '> 70';
 
--- PromQL: oscar:node:disk_utilization > 70
+-- PromQL: infra:node:disk_utilization > 70
 ```
 
-#### Network RX trend per instance — last 24h
+#### I/O wait — average over last 30 minutes, db servers only (1 row per server)
 
 ```sql
-SELECT instance, timestamp, value FROM victoriametrics.oscar_node_network_rx_bytes_rate
-WHERE time_start = 'now-24h'
-  AND time_end = 'now'
-  AND step = '15m';
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_iowait_pct
+WHERE meta_hostname LIKE '%db%'
+  AND fn = 'avg_over_time'
+  AND fn_window = '30m'
+  AND time = 'now';
 
--- PromQL: oscar:node:network_rx_bytes_rate
+-- PromQL: avg_over_time(infra:node:iowait_pct{meta_hostname=~".*db.*"}[30m])
 ```
 
-#### Load per CPU — nodes above 1.0 (saturated)
+#### Load per CPU — nodes above 1.0 (saturated) right now
 
 ```sql
-SELECT instance, value FROM victoriametrics.oscar_node_load_per_cpu
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_load_per_cpu
 WHERE time = 'now'
   AND value = '> 1';
-
--- PromQL: oscar:node:load_per_cpu > 1
 ```
 
 #### Swap usage — any node using swap
 
 ```sql
-SELECT instance, value FROM victoriametrics.oscar_node_swap_utilization
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_swap_utilization
 WHERE time = 'now'
   AND value = '> 0';
-
--- PromQL: oscar:node:swap_utilization > 0
 ```
 
-#### I/O wait — nodes with high iowait (> 20%)
+#### Network RX trend — last 24h at 15-minute resolution (time series)
 
 ```sql
-SELECT instance, value FROM victoriametrics.oscar_node_iowait_pct
-WHERE time = 'now'
-  AND value = '> 20';
+SELECT meta_hostname, timestamp, value
+FROM victoriametrics.infra_node_network_rx_bytes_rate
+WHERE time_start = 'now-24h'
+  AND step = '15m';
 
--- PromQL: oscar:node:iowait_pct > 20
+-- PromQL: infra:node:network_rx_bytes_rate  (range query, start=now-24h, step=15m)
+-- Returns: 96 rows per server (one per 15 minutes over 24h)
+```
+
+#### Network RX average over last 24h — 1 row per server
+
+```sql
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_network_rx_bytes_rate
+WHERE fn = 'avg_over_time'
+  AND fn_window = '24h'
+  AND time = 'now';
 ```
 
 ---
@@ -906,14 +1064,14 @@ Every anomaly metric carries an `anomaly_name` label. These are the exact values
 
 | `anomaly_name` | Maps to | Strategy |
 |---|---|---|
-| `oscar_node_cpu` | `oscar:node:cpu_utilization` | adaptive |
-| `oscar_node_memory` | `oscar:node:memory_utilization` | adaptive |
-| `oscar_node_swap` | `oscar:node:swap_utilization` | robust |
-| `oscar_node_disk` | `oscar:node:disk_utilization` | robust |
-| `oscar_node_iowait` | `oscar:node:iowait_pct` | adaptive |
-| `oscar_node_load_per_cpu` | `oscar:node:load_per_cpu` | adaptive |
-| `oscar_node_network_rx` | `oscar:node:network_rx_bytes_rate` | adaptive |
-| `oscar_node_network_tx` | `oscar:node:network_tx_bytes_rate` | adaptive |
+| `oscar_node_cpu` | `infra:node:cpu_utilization` | adaptive |
+| `oscar_node_memory` | `infra:node:memory_utilization` | adaptive |
+| `oscar_node_swap` | `infra:node:swap_utilization` | robust |
+| `oscar_node_disk` | `infra:node:disk_utilization` | robust |
+| `oscar_node_iowait` | `infra:node:iowait_pct` | adaptive |
+| `infra_node_load_per_cpu` | `infra:node:load_per_cpu` | adaptive |
+| `oscar_node_network_rx` | `infra:node:network_rx_bytes_rate` | adaptive |
+| `oscar_node_network_tx` | `infra:node:network_tx_bytes_rate` | adaptive |
 
 **Additional labels on all anomaly metrics:** `instance`, `job`, `anomaly_type="resource"`, `anomaly_strategy`
 
@@ -1049,7 +1207,7 @@ WHERE metric = 'anomaly:upper_band'
 ```sql
 SELECT instance, timestamp, value FROM victoriametrics.range_query
 WHERE metric = 'anomaly:level'
-  AND anomaly_name = 'oscar_node_load_per_cpu'
+  AND anomaly_name = 'infra_node_load_per_cpu'
   AND time_start = 'now-6h'
   AND step = '1m';
 ```
@@ -1153,15 +1311,235 @@ WHERE metric = 'oscar:vmdb:ingestion_rate'
 
 ---
 
+---
+
+## Natural Language → SQL Translation Guide
+
+> **This section is for AI/LLM agents.** It maps natural language questions about server
+> health into the correct SQL patterns for this handler. Use `meta_hostname LIKE '%name%'`
+> for server filtering. Use `time_start` without `step` to get a single averaged value.
+
+---
+
+### Rule 1 — Identify the right table
+
+| User asks about... | Use table |
+|--------------------|-----------|
+| CPU usage | `infra_node_cpu_utilization` |
+| Memory usage / RAM | `infra_node_memory_utilization` |
+| Swap usage | `infra_node_swap_utilization` |
+| Disk usage / filesystem | `infra_node_disk_utilization` |
+| I/O wait / disk slowness | `infra_node_iowait_pct` |
+| Load average / server load | `infra_node_load_per_cpu` |
+| Network traffic / bandwidth (inbound) | `infra_node_network_rx_bytes_rate` |
+| Network traffic / bandwidth (outbound) | `infra_node_network_tx_bytes_rate` |
+| Anomaly detection / is this abnormal | `instant` with `metric = 'anomaly:level'` |
+| Service up/down | `instant` with `metric = 'up'` |
+| Any other metric | `instant` or `range_query` with `metric = '<name>'` |
+
+---
+
+### Rule 2 — Identify the time intent
+
+| User says... | SQL pattern | Returns |
+|-------------|-------------|---------|
+| "right now", "currently", "at the moment" | `WHERE time = 'now'` | Single current value |
+| "last 30 minutes", "past 30 mins", "30m average" | `WHERE time_start = 'now-30m'` | **Single averaged value per server** |
+| "last hour", "past 1 hour" | `WHERE time_start = 'now-1h'` | **Single averaged value per server** |
+| "last 6 hours" | `WHERE time_start = 'now-6h'` | **Single averaged value per server** |
+| "last 24 hours" | `WHERE time_start = 'now-24h'` | **Single averaged value per server** |
+| "trend", "over time", "chart", "graph" | `WHERE time_start = 'now-1h' AND step = '5m'` | Time series |
+| "peak", "maximum", "worst" | `WHERE time_start = 'now-Xh' AND fn = 'max_over_time'` | Single peak value |
+| "minimum", "best", "lowest" | `WHERE time_start = 'now-Xh' AND fn = 'min_over_time'` | Single minimum value |
+
+> **Key insight:** When `time_start` is set WITHOUT `step` and WITHOUT `fn`, the handler
+> automatically wraps the query in `avg_over_time[window]` — returning one averaged value
+> per server. This is the correct behaviour for "give me X for the last N minutes".
+
+---
+
+### Rule 3 — Server/hostname filtering
+
+Always use `meta_hostname LIKE '%partial%'` for server name matching.
+Never assume you know the exact hostname — use LIKE with partial names.
+
+```sql
+-- User: "for web-server-01"
+WHERE meta_hostname LIKE '%web-server-01%'
+
+-- User: "for all web servers"
+WHERE meta_hostname LIKE '%web%'
+
+-- User: "for all db servers"
+WHERE meta_hostname LIKE '%db%'
+
+-- User: "for web-server-01 and db-server-01"
+WHERE (meta_hostname LIKE '%web-server-01%' OR meta_hostname LIKE '%db-server-01%')
+
+-- User: "in production"
+WHERE environment = 'production'
+
+-- User: "in dc1"
+WHERE datacenter = 'dc1'
+
+-- User: "for all production web servers"
+WHERE environment = 'production' AND meta_hostname LIKE '%web%'
+```
+
+---
+
+### Rule 4 — Threshold / alerting intent
+
+```sql
+-- User: "which servers have high CPU?" / "CPU above 80%"
+WHERE time = 'now' AND value = '> 80'
+
+-- User: "servers with low memory" / "memory usage above 90%"
+WHERE time = 'now' AND value = '> 90'
+
+-- User: "any disk almost full?" / "disk usage over 85%"
+WHERE time = 'now' AND value = '> 85'
+
+-- User: "servers with high IO wait"
+WHERE time = 'now' AND value = '> 10'
+
+-- User: "overloaded servers" / "load above 1.5 per CPU"
+WHERE time = 'now' AND value = '> 1.5'
+```
+
+---
+
+### Complete NL → SQL Examples
+
+#### "Give me CPU utilization for the last 30 minutes for web-server-01 and db-server-01"
+
+```sql
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE (meta_hostname LIKE '%web-server-01%' OR meta_hostname LIKE '%db-server-01%')
+  AND time_start = 'now-30m';
+
+-- Handler auto-aggregates: avg_over_time[30m] at now
+-- Returns: 2 rows — one average per server
+```
+
+#### "What is the current memory usage of all production servers?"
+
+```sql
+SELECT meta_hostname, meta_ipaddress, environment, value
+FROM victoriametrics.infra_node_memory_utilization
+WHERE environment = 'production'
+  AND time = 'now';
+
+-- Returns: 1 row per production server, current memory %
+```
+
+#### "Which servers have disk usage above 80%?"
+
+```sql
+SELECT meta_hostname, meta_ipaddress, mountpoint, value
+FROM victoriametrics.infra_node_disk_utilization
+WHERE time = 'now'
+  AND value = '> 80';
+
+-- Returns: only servers/mountpoints where disk is above 80%
+```
+
+#### "Show me the CPU trend for db-server-01 over the last hour"
+
+```sql
+SELECT meta_hostname, timestamp, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE meta_hostname LIKE '%db-server-01%'
+  AND time_start = 'now-1h'
+  AND step = '5m';
+
+-- step is explicitly set → raw time series, 12 data points
+```
+
+#### "What was the average IO wait for all servers in the last 6 hours?"
+
+```sql
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_iowait_pct
+WHERE time_start = 'now-6h';
+
+-- Returns: 1 row per server with 6-hour average IO wait %
+```
+
+#### "What was the peak CPU for web servers in the last 24 hours?"
+
+```sql
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_cpu_utilization
+WHERE meta_hostname LIKE '%web%'
+  AND time_start = 'now-24h'
+  AND fn = 'max_over_time';
+
+-- fn is explicit → max_over_time(metric[24h]) at now
+-- Returns: 1 row per web server with peak value
+```
+
+#### "Is server db-server-01 experiencing high load right now?"
+
+```sql
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_load_per_cpu
+WHERE meta_hostname LIKE '%db-server-01%'
+  AND time = 'now';
+
+-- Returns current load/CPU ratio. > 1.0 = saturated
+```
+
+#### "Compare memory usage between web-server-01 and web-server-02"
+
+```sql
+SELECT meta_hostname, value
+FROM victoriametrics.infra_node_memory_utilization
+WHERE (meta_hostname LIKE '%web-server-01%' OR meta_hostname LIKE '%web-server-02%')
+  AND time_start = 'now-1h';
+
+-- Returns: 2 rows, 1-hour avg memory % for each server
+```
+
+#### "Which servers are causing network traffic spikes right now?"
+
+```sql
+SELECT meta_hostname, meta_ipaddress, value
+FROM victoriametrics.infra_node_network_rx_bytes_rate
+WHERE time = 'now'
+ORDER BY value DESC
+LIMIT 5;
+
+-- Returns top 5 servers by current inbound traffic
+```
+
+---
+
+### Anti-Patterns to Avoid
+
+| Wrong | Right | Why |
+|-------|-------|-----|
+| `WHERE instance = '10.0.1.10:9100'` | `WHERE meta_hostname LIKE '%web-server-01%'` | Users say hostnames, not IPs |
+| `WHERE time_start = 'now-30m' AND step = '1m'` | `WHERE time_start = 'now-30m'` | Step forces time series; omit it for a summary |
+| `LIKE 'web.*'` | `LIKE 'web%'` | Use SQL `%` wildcards, not regex — auto-converted |
+| `WHERE value = '80'` | `WHERE value = '> 80'` | value filter requires an operator |
+| Querying `instance` table for node metrics | Use named tables like `infra_node_cpu_utilization` | Named tables don't need `WHERE metric = ...` |
+
+---
+
 ## Troubleshooting
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `Syntax error: expected symbol '[Identifier]' near start` | `start`, `end`, `range`, or `window` are SQL reserved words | Use `time_start`/`time_end`, `fn_window`, and `range_query` table name |
-| `WHERE metric = '<name>' is required` | No `metric` condition on `instant`/`range_query` | Always include `AND metric = 'your_metric'`, or use a named table (e.g. `oscar_node_cpu_utilization`) |
+| `WHERE metric = '<name>' is required` | No `metric` condition on `instant`/`range_query` | Always include `AND metric = 'your_metric'`, or use a named table (e.g. `infra_node_cpu_utilization`) |
 | `Range queries require: WHERE time_start = ...` | *(No longer thrown — defaults to last 1 hour)* | — |
 | `Binder Error: Referenced column "job" not found` | Metric doesn't have that label | Use `SELECT *` or run `SELECT * FROM victoriametrics.labels WHERE metric = '...'` first |
 | Empty result set | Metric or labels don't match | Use `labels` table to discover valid label values |
-| Empty result on `anomaly:*` metrics | No node_exporter data in vmdb | Check vmagent has node-exporter targets; inject synthetic data for local dev (see pipeline doc §11) |
-| Wrong `anomaly_name` value | Using wrong label value | Use exact names: `oscar_node_cpu`, `oscar_node_memory`, `oscar_node_swap`, `oscar_node_disk`, `oscar_node_iowait`, `oscar_node_load_per_cpu`, `oscar_node_network_rx`, `oscar_node_network_tx` |
+| Empty result with `LIKE` pattern | Pattern not matching any hostname | Check exact hostnames with `SELECT * FROM victoriametrics.infra_node_cpu_utilization WHERE time = 'now'` first |
+| Empty result on `anomaly:*` metrics | No node_exporter data in vmdb | Check vmagent has node-exporter targets; inject synthetic data for local dev using `scripts/inject_test_node_metrics.py` |
+| Wrong `anomaly_name` value | Using wrong label value | Use exact names: `oscar_node_cpu`, `oscar_node_memory`, `oscar_node_swap`, `oscar_node_disk`, `oscar_node_iowait`, `infra_node_load_per_cpu`, `oscar_node_network_rx`, `oscar_node_network_tx` |
+| Got many rows instead of 1 per server | Accidentally set `step` when wanting an average | Remove `step` from WHERE — it forces a time series. Use `time_start='now-Xm'` alone for auto-aggregation. |
+| `meta_hostname` column missing from results | Running old kore image without updated handler | Rebuild kore image: `./oscar compile kore && ./oscar restart kore` |
 | `Cannot reach http://vmdb:8428` | VictoriaMetrics unreachable | Check `vmdb` container is running: `docker ps \| grep vmdb` |
