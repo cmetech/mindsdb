@@ -9,10 +9,9 @@ name: Add Pull Requests to PR review project
 permissions:
   contents: read
 
+# GitLab runners are the default; Depot execution is opt-in.
 on:
-  pull_request:
-    types:
-      - opened
+  workflow_dispatch:
 
 jobs:
   add-to-project:

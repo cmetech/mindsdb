@@ -13,15 +13,10 @@ permissions:
   pages: write
   id-token: write
 
+# GitLab runners are the default; Depot execution is opt-in.
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, labeled]
-    branches:
-      - 'main'
-      - 'releases/*'
+  workflow_dispatch:
 
-# Cancel any existing runs of this workflow on the same branch/pr
-# We always want to build/deploy/test a new commit over an older one
 concurrency:
   group: ${{ github.workflow_ref }}
   cancel-in-progress: true

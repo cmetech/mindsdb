@@ -12,11 +12,9 @@ permissions:
   pull-requests: write
   statuses: write
 
+# GitLab runners are the default; Depot execution is opt-in.
 on:
-  issue_comment:
-    types: [created]
-  pull_request_target:
-    types: [opened,closed,synchronize]
+  workflow_dispatch:
 
 jobs:
   CLAssistant:
