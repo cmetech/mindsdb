@@ -1,0 +1,23 @@
+# Depot CI Migration
+# Source: .github/workflows/add_to_roadmap_project_v2.yml
+#
+# Changes made:
+# - Removed unsupported trigger "issues"
+# - Changed GitHub runs-on labels to their Depot equivalents
+
+name: Add issue to roadmap project
+
+permissions:
+  contents: read
+
+# Removed unsupported trigger: issues. Issue events are not supported.
+on: {}
+jobs:
+  add-to-project:
+    name: Add issue to roadmap project
+    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    steps:
+      - uses: actions/add-to-project@v0.4.0
+        with:
+          project-url: https://github.com/orgs/mindsdb/projects/53
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
